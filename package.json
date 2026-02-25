@@ -1,0 +1,31 @@
+{
+  "name": "power-renamer",
+  "version": "1.0.0",
+  "description": "文件重命名工具 - 支持自定义 JavaScript 重命名逻辑",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:LasyIsLazy/power-renamer.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@tauri-apps/plugin-fs": "^2.0.0",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21",
+    "monaco-editor": "^0.45.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.0"
+  }
+}
