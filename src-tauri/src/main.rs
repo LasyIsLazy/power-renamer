@@ -19,11 +19,16 @@ fn main() {
             preview_rename,
             execute_rename,
             get_folder_files,
+            get_folder_dirs,
             load_saved_scripts,
             save_script,
             delete_script,
             rename_script,
-            get_config_path_display
+            open_script_file,
+            get_scripts_dir_display,
+            save_script_manifest,
+            get_script_manifest,
+            open_script_manifest
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

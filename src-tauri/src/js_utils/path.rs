@@ -77,12 +77,28 @@ pub fn sep() -> String {
 
 /// 判断路径是否为文件
 pub fn is_file(path: String) -> bool {
-    Path::new(&path).is_file()
+    let path_buf = Path::new(&path);
+    // 先检查路径是否存在
+    if !path_buf.exists() {
+        eprintln!("[DEBUG] is_file: Path does not exist: {}", path);
+        return false;
+    }
+    let result = path_buf.is_file();
+    eprintln!("[DEBUG] is_file: path={}, exists={}, is_file={}", path, path_buf.exists(), result);
+    result
 }
 
 /// 判断路径是否为目录
 pub fn is_dir(path: String) -> bool {
-    Path::new(&path).is_dir()
+    let path_buf = Path::new(&path);
+    // 先检查路径是否存在
+    if !path_buf.exists() {
+        eprintln!("[DEBUG] is_dir: Path does not exist: {}", path);
+        return false;
+    }
+    let result = path_buf.is_dir();
+    eprintln!("[DEBUG] is_dir: path={}, exists={}, is_dir={}", path, path_buf.exists(), result);
+    result
 }
 
 /// 判断路径是否存在

@@ -17,11 +17,41 @@
       <p>正在预览...</p>
     </div>
 
-    <div v-else-if="!store.hasPreview" class="empty">
+    <div v-else-if="!store.hasPreviewed" class="empty">
       <p>点击"预览"按钮查看重命名结果</p>
     </div>
 
-    <div v-else class="preview-list">
+    <div v-else-if="store.hasPreviewed && store.previewResults.length === 0" class="empty">
+      <p class="no-changes">✓ 没有文件需要重命名，所有文件名保持不变</p>
+      <!-- 即使没有预览结果，也显示日志 -->
+      <div class="script-logs" style="margin-top: 16px;">
+        <div class="logs-header">脚本日志:</div>
+        <div class="logs-content">
+          <div v-if="store.scriptLogs && store.scriptLogs.length > 0">
+            <div v-for="(log, index) in store.scriptLogs" :key="index" class="log-item">
+              {{ log }}
+            </div>
+          </div>
+          <div v-else class="log-empty">暂无日志输出</div>
+        </div>
+      </div>
+    </div>
+
+    <div v-else class="preview-content">
+      <!-- 固定显示脚本日志区域 -->
+      <div class="script-logs">
+        <div class="logs-header">脚本日志:</div>
+        <div class="logs-content">
+          <div v-if="store.scriptLogs && store.scriptLogs.length > 0">
+            <div v-for="(log, index) in store.scriptLogs" :key="index" class="log-item">
+              {{ log }}
+            </div>
+          </div>
+          <div v-else class="log-empty">暂无日志输出</div>
+        </div>
+      </div>
+
+      <!-- 显示预览结果 -->
       <div
         v-for="(result, index) in store.previewResults"
         :key="index"
@@ -47,7 +77,7 @@
       </div>
     </div>
 
-    <div v-if="store.hasPreview" class="footer">
+    <div v-if="store.hasPreviewed && store.previewResults.length > 0" class="footer">
       <div class="stats">
         <span>共 {{ store.previewResults.length }} 个文件</span>
         <span v-if="changedCount > 0">
@@ -75,6 +105,7 @@ const canPreview = computed(() => {
   return store.hasFiles && store.scriptValid
 })
 
+
 const changedCount = computed(() => {
   return store.previewResults.filter((r) => hasChanged(r)).length
 })
@@ -89,9 +120,12 @@ const hasChanged = (result) => {
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
+  max-height: 100%;
   border: 1px solid #e0e0e0;
   border-radius: 8px;
   overflow: hidden;
+  position: relative;
 }
 
 .header {
@@ -101,6 +135,7 @@ const hasChanged = (result) => {
   padding: 12px 16px;
   background: #f5f5f5;
   border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
 }
 
 .header h3 {
@@ -149,15 +184,24 @@ const hasChanged = (result) => {
 .loading,
 .empty {
   flex: 1;
+  min-height: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   color: #666;
+  padding: 16px;
 }
 
-.preview-list {
+.empty .no-changes {
+  color: #28a745;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.preview-content {
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
   padding: 8px;
 }
 
@@ -233,6 +277,7 @@ const hasChanged = (result) => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .stats {
@@ -241,5 +286,45 @@ const hasChanged = (result) => {
   gap: 4px;
   font-size: 12px;
   color: #666;
+}
+
+.script-logs {
+  margin-bottom: 16px;
+  padding: 12px;
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.logs-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: #495057;
+  margin-bottom: 8px;
+}
+
+.logs-content {
+  font-family: Monaco, 'Courier New', monospace;
+  font-size: 12px;
+  background: #fff;
+  padding: 8px;
+  border-radius: 2px;
+}
+
+.log-item {
+  padding: 2px 0;
+  color: #333;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-empty {
+  padding: 8px 0;
+  color: #999;
+  font-style: italic;
+  text-align: center;
 }
 </style>

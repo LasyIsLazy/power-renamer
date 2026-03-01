@@ -14,7 +14,7 @@
       </div>
 
       <div class="middle-panel">
-        <ScriptEditor />
+        <ScriptList />
       </div>
 
       <div class="right-panel">
@@ -33,7 +33,7 @@
 import { onMounted } from 'vue'
 import { useRenameStore } from './stores/renameStore'
 import FileSelector from './components/FileSelector.vue'
-import ScriptEditor from './components/ScriptEditor.vue'
+import ScriptList from './components/ScriptList.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 
@@ -105,7 +105,29 @@ onMounted(() => {
   display: flex;
   gap: 16px;
   padding: 16px;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 确保滚动条可见 */
+  scrollbar-width: thin;
+  scrollbar-color: #c0c0c0 #f0f0f0;
+}
+
+/* Webkit 浏览器滚动条样式 */
+.app-content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.app-content::-webkit-scrollbar-track {
+  background: #f0f0f0;
+}
+
+.app-content::-webkit-scrollbar-thumb {
+  background: #c0c0c0;
+  border-radius: 4px;
+}
+
+.app-content::-webkit-scrollbar-thumb:hover {
+  background: #a0a0a0;
 }
 
 .left-panel {

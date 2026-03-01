@@ -36,16 +36,31 @@ export const useRenameStore = defineStore('rename', {
   state: () => ({
     files: [], // 文件列表 [{ name, path, size, modified }]
     script: `function rename() {
-  // 示例：返回原文件名（不进行修改）
-  return __fileName;
+  // 返回对象格式：{原始路径: 新路径}
+  // 使用 console.log() 来输出日志，日志会在预览面板中显示
+  // console.log('处理文件:', __fileName);
+  
+  // 单个文件示例：
+  return {[__filePath]: __fileName};
+  
+  // 批量重命名示例（文件夹场景）：
+  // var result = {};
+  // var files = __utils.fs.readDirFilesRecursive(__filePath);
+  // for (var i = 0; i < files.length; i++) {
+  //   console.log('处理文件:', files[i]);
+  //   result[files[i]] = 'new_name_' + i;
+  // }
+  // return result;
 }`,
     previewResults: [], // 预览结果 [{ original, new_name, error }]
+    hasPreviewed: false, // 是否已执行过预览（即使结果为空）
     history: [], // 历史记录 [{ timestamp, files, script, results }]
     undoStack: [], // 撤销栈 [{ files, mappings }]
     basePath: null, // 基础路径（如果选择的是文件夹）
     loading: false,
     error: null,
     savedScripts: [], // 保存的脚本模板 [{ id, name, script, created_at, updated_at }]
+    currentScriptId: null, // 当前使用的脚本 ID
   }),
 
   getters: {
@@ -93,7 +108,6 @@ export const useRenameStore = defineStore('rename', {
     async selectFolder() {
       try {
         const open = await getOpen()
-        const invoke = await getInvoke()
         const selected = await open({
           multiple: false,
           directory: true,
@@ -101,16 +115,17 @@ export const useRenameStore = defineStore('rename', {
 
         if (selected) {
           this.basePath = selected
-          const files = await invoke('get_folder_files', {
-            folderPath: selected,
-          })
-
-          this.files = files.map((name) => ({
-            name,
-            path: `${selected}/${name}`,
+          // 只显示选中的文件夹本身
+          // 注意：当选择文件夹时，files 中只存储文件夹名，不存储完整路径
+          // 这样在 previewRename 时，会传递 name，然后 Rust 端会用 basePath 拼接
+          const folderName = selected.split(/[/\\]/).pop() || selected
+          this.files = [{
+            name: folderName,
+            path: folderName, // 只存储文件夹名，不存储完整路径
             size: 0,
             modified: new Date().toISOString(),
-          }))
+          }]
+          console.log('[DEBUG] selectFolder: basePath=', this.basePath, 'folderName=', folderName, 'files=', this.files)
         }
       } catch (error) {
         this.error = `选择文件夹失败: ${error}`
@@ -122,20 +137,25 @@ export const useRenameStore = defineStore('rename', {
     removeFile(index) {
       this.files.splice(index, 1)
       this.previewResults = []
+      this.hasPreviewed = false
     },
 
     // 清空文件列表
     clearFiles() {
       this.files = []
       this.previewResults = []
+      this.hasPreviewed = false
       this.basePath = null
     },
 
     // 更新脚本
     updateScript(script) {
       this.script = script
-      // 脚本变化时清空预览
+      // 脚本变化时清空预览和当前脚本标识
       this.previewResults = []
+      this.hasPreviewed = false
+      this.scriptLogs = []
+      this.currentScriptId = null // 手动编辑脚本时，清除当前脚本标识
     },
 
     // 预览重命名
@@ -150,13 +170,15 @@ export const useRenameStore = defineStore('rename', {
 
       try {
         const invoke = await getInvoke()
-        // 如果 basePath 存在，传递文件名；否则传递完整路径
+        // 如果 basePath 存在，直接传递 basePath（文件夹路径）；否则传递文件的完整路径
         const fileNames = this.basePath 
-          ? this.files.map((f) => f.name)
+          ? [this.basePath] // 选择文件夹时，直接传递 basePath，不需要拼接
           : this.files.map((f) => f.path)
+        console.log('[DEBUG] previewRename: basePath=', this.basePath, 'fileNames=', fileNames)
         const result = await invoke('preview_rename', {
           files: fileNames,
           script: this.script,
+          basePath: null, // 选择文件夹时，不传递 basePath，因为 fileNames 已经是完整路径
         })
 
         this.previewResults = result.mappings.map(([original, new_name]) => ({
@@ -165,6 +187,13 @@ export const useRenameStore = defineStore('rename', {
           error: null,
         }))
 
+        // 保存日志
+        this.scriptLogs = result.logs || []
+        console.log('[DEBUG] Frontend: Received logs:', this.scriptLogs.length, this.scriptLogs)
+
+        // 标记已执行过预览
+        this.hasPreviewed = true
+
         if (result.errors && result.errors.length > 0) {
           this.error = result.errors.join('; ')
         }
@@ -172,6 +201,7 @@ export const useRenameStore = defineStore('rename', {
         this.error = `预览失败: ${error}`
         console.error(error)
         this.previewResults = []
+        this.hasPreviewed = false
       } finally {
         this.loading = false
       }
@@ -197,14 +227,15 @@ export const useRenameStore = defineStore('rename', {
 
       try {
         const invoke = await getInvoke()
-        // 如果 basePath 存在，传递文件名；否则传递完整路径
+        // 如果 basePath 存在，传递 basePath 本身（因为选择文件夹时，basePath 就是文件夹路径）
+        // 否则传递文件的完整路径
         const fileNames = this.basePath 
-          ? this.files.map((f) => f.name)
+          ? [this.basePath] // 选择文件夹时，直接传递 basePath，不需要拼接
           : this.files.map((f) => f.path)
         const results = await invoke('execute_rename', {
           files: fileNames,
           script: this.script,
-          basePath: this.basePath,
+          basePath: null, // 选择文件夹时，不传递 basePath，因为 fileNames 已经是完整路径
         })
 
         // 保存到撤销栈
@@ -336,7 +367,7 @@ export const useRenameStore = defineStore('rename', {
       this.error = null
     },
 
-    // 保存脚本模板
+    // 保存脚本模板（保存为文件）
     async saveScript(name, script, scriptId = null) {
       try {
         const invoke = await getInvoke()
@@ -346,13 +377,8 @@ export const useRenameStore = defineStore('rename', {
           scriptId,
         })
         
-        // 更新本地状态
-        const index = this.savedScripts.findIndex((s) => s.id === saved.id)
-        if (index !== -1) {
-          this.savedScripts[index] = saved
-        } else {
-          this.savedScripts.push(saved)
-        }
+        // 刷新脚本列表
+        await this.initSavedScripts()
         
         return true
       } catch (error) {
@@ -367,7 +393,9 @@ export const useRenameStore = defineStore('rename', {
       const script = this.savedScripts.find((s) => s.id === scriptId)
       if (script) {
         this.script = script.script
+        this.currentScriptId = scriptId // 记录当前使用的脚本 ID
         this.previewResults = [] // 清空预览
+        this.hasPreviewed = false // 重置预览状态
         return true
       }
       return false
@@ -378,6 +406,11 @@ export const useRenameStore = defineStore('rename', {
       try {
         const invoke = await getInvoke()
         await invoke('delete_script', { scriptId })
+        
+        // 如果删除的是当前使用的脚本，清除当前脚本标识
+        if (this.currentScriptId === scriptId) {
+          this.currentScriptId = null
+        }
         
         // 更新本地状态
         const index = this.savedScripts.findIndex((s) => s.id === scriptId)
@@ -399,12 +432,8 @@ export const useRenameStore = defineStore('rename', {
         const invoke = await getInvoke()
         await invoke('rename_script', { scriptId, newName })
         
-        // 更新本地状态
-        const script = this.savedScripts.find((s) => s.id === scriptId)
-        if (script) {
-          script.name = newName.trim()
-          script.updated_at = new Date().toISOString()
-        }
+        // 重命名后需要重新加载脚本列表，因为脚本 ID 会改变（基于文件名）
+        // 不在这里更新本地状态，而是让调用者重新加载列表
         
         return true
       } catch (error) {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rquickjs::{Context as JsContext, Runtime as JsRuntime};
+use rquickjs::{Context as JsContext, Function, Runtime as JsRuntime, Value as JsValue};
 use serde_json::Value as JsonValue;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +14,7 @@ pub enum RenameResult {
 
 pub struct JsEngine {
     runtime: Arc<Mutex<JsRuntime>>,
+    log_collector: crate::js_utils::LogCollector,
 }
 
 unsafe impl Send for JsEngine {}
@@ -24,6 +25,7 @@ impl JsEngine {
         let runtime = JsRuntime::new().context("Failed to create JS runtime")?;
         Ok(Self {
             runtime: Arc::new(Mutex::new(runtime)),
+            log_collector: crate::js_utils::LogCollector::new(),
         })
     }
 
@@ -40,69 +42,87 @@ impl JsEngine {
         let context = JsContext::full(&runtime)
             .context("Failed to create JS context")?;
 
+        // 清空之前的日志
+        self.log_collector.clear();
+
         // 执行脚本
         let result = context.with(|ctx| {
-            // 1. 首先注入 JS 工具函数到 __utils 对象（path、md5、fs）
+            // 1. 首先注入 JS 工具函数到 __utils 对象（path、md5、fs、log）
             // 这些工具函数需要在编译脚本之前就注入，这样脚本编译时就能访问到
-            crate::js_utils::setup_js_utils(&ctx)
-                .context("Failed to setup JS utils")?;
+            crate::js_utils::setup_js_utils(&ctx, Some(&self.log_collector))
+                .with_context(|| {
+                    format!(
+                        "Failed to setup JS utils. This may be due to:\n\
+                        1. QuickJS context initialization issues\n\
+                        2. Console.log hijacking problems\n\
+                        3. Function binding errors\n\
+                        Please check the error details above."
+                    )
+                })?;
             
             // 2. 编译脚本（用户脚本直接定义 rename 函数）
             // 此时脚本已经可以访问 __utils.path、__utils.md5、__utils.fs 等工具函数
             ctx.eval::<(), _>(script)
                 .context("Failed to compile JS script")?;
             
-            // 3. 设置执行时的全局变量（每次调用可能不同）
+            // 3. 从全局作用域获取 rename 函数
+            let rename_value: JsValue = ctx.globals()
+                .get("rename")
+                .context("Failed to get rename function from global scope. Make sure your script defines 'function rename() { ... }'")?;
+            
+            let rename_fn = Function::from_value(rename_value)
+                .context("rename is not a function")?;
+            
+            // 4. 设置执行时的全局变量（每次调用可能不同）
             if let Some(path) = file_path {
                 ctx.globals().set("__filePath", path)
                     .context("Failed to set __filePath")?;
             } else {
-                // 使用 null 字符串，在 JS 端会被解析为 null
                 ctx.eval::<(), _>("var __filePath = null;")
-                    .context("Failed to set __filePath")?;
+                    .context("Failed to set __filePath to null")?;
             }
             ctx.globals().set("__fileName", filename)
                 .context("Failed to set __fileName")?;
             
-            // 4. 调用 rename 函数并序列化结果
-            // 由于 rquickjs 的 Value 类型转换复杂，我们在 JS 端处理返回值
-            let json_str: String = ctx.eval(
-                r#"
+            // 5. 调用 rename 函数
+            let result: JsValue = rename_fn.call(())
+                .context("Failed to call rename function")?;
+            
+            // 6. 将结果转换为 JSON 以便处理
+            // 要求用户脚本返回对象格式 {原始路径: 新路径}
+            let serialize_script = r#"
                 (function() {
                     try {
-                        var result = rename();
-                        if (typeof result === 'string') {
-                            return JSON.stringify({type: 'single', value: result});
-                        } else if (Array.isArray(result)) {
-                            return JSON.stringify({type: 'batch', value: result});
-                        } else if (typeof result === 'object' && result !== null) {
-                            var batch = [];
-                            for (var key in result) {
-                                if (result.hasOwnProperty(key)) {
-                                    batch.push([key, result[key]]);
-                                }
-                            }
-                            return JSON.stringify({type: 'batch', value: batch});
-                        } else {
-                            throw new Error('rename function must return a string, object, or array');
+                        var result = globalThis.__rename_result_temp;
+                        
+                        // 必须是对象格式
+                        if (typeof result !== 'object' || result === null) {
+                            throw new Error('rename function must return an object: {原始路径: 新路径}');
                         }
+                        
+                        return JSON.stringify(result);
                     } catch (error) {
                         var errorMsg = error.message || String(error);
                         if (error.stack) {
                             errorMsg += '\nStack: ' + error.stack;
                         }
-                        return JSON.stringify({type: 'error', value: errorMsg});
+                        return JSON.stringify({__error__: errorMsg});
                     }
                 })()
-                "#
-            )
-            .context("Failed to execute rename function")?;
+            "#;
+            ctx.globals().set("__rename_result_temp", result)?;
+            let json_str: String = ctx.eval(serialize_script)
+                .context("Failed to serialize JS result to JSON")?;
             
-            // 5. 解析 JSON
+            // 7. 日志已经在 log_collector 中收集（通过 console.log 调用）
+            // 在返回前检查日志数量（通过反射访问内部字段）
+            // 注意：这里我们不能直接访问私有字段，所以先不检查
+            
+            // 8. 解析 JSON
             let result_value: JsonValue = serde_json::from_str(&json_str)
                 .context("Failed to parse JS result as JSON")?;
             
-            // 6. 处理结果
+            // 9. 处理结果
             self.parse_rename_result_from_json(result_value)
         })?;
 
@@ -110,70 +130,46 @@ impl JsEngine {
     }
     
     /// 从 JSON 解析重命名函数的返回值
+    /// 统一格式：对象 {原始路径: 新路径}
     fn parse_rename_result_from_json(&self, result_value: JsonValue) -> Result<RenameResult> {
         // 检查是否有错误
-        if let Some(error_type) = result_value.get("type").and_then(|v| v.as_str()) {
-            if error_type == "error" {
-                let error_msg = result_value.get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error");
-                anyhow::bail!("JS script error: {}", error_msg);
-            }
+        if let Some(error_msg) = result_value.get("__error__").and_then(|v| v.as_str()) {
+            anyhow::bail!("JS script error: {}", error_msg);
         }
         
-        let result_type = result_value.get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid result format: missing type"))?;
+        // 解析对象格式 {原始路径: 新路径}
+        let obj = result_value.as_object()
+            .ok_or_else(|| anyhow::anyhow!("Invalid result format: must be an object"))?;
         
-        match result_type {
-            "single" => {
-                let value = result_value.get("value")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Invalid result format: missing value"))?;
-                
-                if value.is_empty() {
-                    anyhow::bail!("Rename function returned empty string");
-                }
-                
-                if value.len() > 255 {
-                    anyhow::bail!("New filename exceeds maximum length of 255 characters");
-                }
-                
-                Ok(RenameResult::Single(value.to_string()))
+        let mut mappings = Vec::new();
+        
+        for (original, new_name_value) in obj {
+            let new_name = new_name_value.as_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid result format: new_name must be string"))?
+                .to_string();
+            
+            if new_name.is_empty() {
+                anyhow::bail!("New filename cannot be empty");
             }
-            "batch" => {
-                let value = result_value.get("value")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| anyhow::anyhow!("Invalid result format: batch value must be array"))?;
-                
-                let mut mappings = Vec::new();
-                for item in value {
-                    if let Some(arr) = item.as_array() {
-                        if arr.len() >= 2 {
-                            let original = arr[0].as_str()
-                                .ok_or_else(|| anyhow::anyhow!("Invalid batch format: original must be string"))?
-                                .to_string();
-                            let new_name = arr[1].as_str()
-                                .ok_or_else(|| anyhow::anyhow!("Invalid batch format: new_name must be string"))?
-                                .to_string();
-                            
-                            if new_name.is_empty() {
-                                anyhow::bail!("New filename cannot be empty");
-                            }
-                            
-                            if new_name.len() > 255 {
-                                anyhow::bail!("New filename exceeds maximum length of 255 characters");
-                            }
-                            
-                            mappings.push((original, new_name));
-                        }
-                    }
-                }
-                
-                Ok(RenameResult::Batch(mappings))
+            
+            if new_name.len() > 255 {
+                anyhow::bail!("New filename exceeds maximum length of 255 characters");
             }
-            _ => anyhow::bail!("Invalid result type: {}", result_type),
+            
+            mappings.push((original.clone(), new_name));
         }
+        
+        // 如果只有一个映射，返回 Single；否则返回 Batch
+        if mappings.len() == 1 {
+            Ok(RenameResult::Single(mappings[0].1.clone()))
+        } else {
+            Ok(RenameResult::Batch(mappings))
+        }
+    }
+
+    /// 获取收集的日志
+    pub fn get_logs(&self) -> Vec<String> {
+        self.log_collector.take_logs()
     }
 
     /// 执行重命名（对单个文件或文件夹）

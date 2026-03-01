@@ -91,6 +91,7 @@ const handleDrop = async (event) => {
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
   border: 1px solid #e0e0e0;
   border-radius: 8px;
   overflow: hidden;
@@ -184,7 +185,9 @@ const handleDrop = async (event) => {
 
 .file-list {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 8px;
 }
 
