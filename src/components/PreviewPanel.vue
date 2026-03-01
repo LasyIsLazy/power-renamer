@@ -13,6 +13,51 @@
       </div>
     </div>
 
+    <!-- 参数输入区域 -->
+    <div v-if="currentScript && currentScript.parameters && currentScript.parameters.length > 0" class="script-params-preview">
+      <div class="params-header" @click="toggleParamsPreview">
+        <span>脚本参数</span>
+        <span class="params-toggle">{{ expandedParamsPreview ? '▼' : '▶' }}</span>
+      </div>
+      <div v-if="expandedParamsPreview" class="params-content">
+        <div
+          v-for="param in currentScript.parameters"
+          :key="param.name"
+          class="param-item"
+        >
+          <label class="param-label">
+            {{ param.name }}
+            <span v-if="param.required" class="required">*</span>
+            <span v-if="param.description" class="param-desc">({{ param.description }})</span>
+          </label>
+          <input
+            v-if="param.type === 'string'"
+            type="text"
+            :value="getParamValue(param.name)"
+            @input="updateParam(param.name, $event.target.value)"
+            class="param-input"
+            :class="{ error: isParamInvalid(param) }"
+          />
+          <input
+            v-else-if="param.type === 'number'"
+            type="number"
+            :value="getParamValue(param.name)"
+            @input="updateParam(param.name, parseFloat($event.target.value) || 0)"
+            class="param-input"
+            :class="{ error: isParamInvalid(param) }"
+          />
+          <label v-else-if="param.type === 'boolean'" class="param-checkbox">
+            <input
+              type="checkbox"
+              :checked="getParamValue(param.name)"
+              @change="updateParam(param.name, $event.target.checked)"
+            />
+            <span>{{ param.description || param.name }}</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
     <div v-if="store.loading" class="loading">
       <p>正在预览...</p>
     </div>
@@ -22,7 +67,12 @@
     </div>
 
     <div v-else-if="store.hasPreviewed && store.previewResults.length === 0" class="empty">
-      <p class="no-changes">✓ 没有文件需要重命名，所有文件名保持不变</p>
+      <!-- 显示错误信息 -->
+      <div v-if="store.error" class="error-section">
+        <div class="error-title">执行错误:</div>
+        <div class="error-content">{{ store.error }}</div>
+      </div>
+      <p v-else class="no-changes">✓ 没有文件需要重命名，所有文件名保持不变</p>
       <!-- 即使没有预览结果，也显示日志 -->
       <div class="script-logs" style="margin-top: 16px;">
         <div class="logs-header">脚本日志:</div>
@@ -96,10 +146,59 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRenameStore } from '../stores/renameStore'
 
 const store = useRenameStore()
+const expandedParamsPreview = ref(false)
+
+// 获取当前脚本
+const currentScript = computed(() => {
+  if (!store.currentScriptId) {
+    return null
+  }
+  return store.savedScripts.find((s) => s.id === store.currentScriptId)
+})
+
+// 切换参数区域的展开/折叠
+const toggleParamsPreview = () => {
+  expandedParamsPreview.value = !expandedParamsPreview.value
+}
+
+// 获取参数值
+const getParamValue = (paramName) => {
+  if (!store.currentScriptId) {
+    return undefined
+  }
+  const params = store.scriptParams[store.currentScriptId]
+  if (!params) {
+    return undefined
+  }
+  return params[paramName]
+}
+
+// 更新参数值
+const updateParam = (paramName, value) => {
+  if (!store.currentScriptId) {
+    return
+  }
+  store.setScriptParam(store.currentScriptId, paramName, value)
+}
+
+// 检查参数是否无效
+const isParamInvalid = (param) => {
+  if (!param.required) {
+    return false
+  }
+  const value = getParamValue(param.name)
+  if (value === undefined || value === null || value === '') {
+    return true
+  }
+  if (param.type === 'number' && isNaN(value)) {
+    return true
+  }
+  return false
+}
 
 const canPreview = computed(() => {
   return store.hasFiles && store.scriptValid
@@ -326,5 +425,113 @@ const hasChanged = (result) => {
   color: #999;
   font-style: italic;
   text-align: center;
+}
+
+.error-section {
+  margin-bottom: 16px;
+  padding: 12px;
+  background: #fee;
+  border: 1px solid #fcc;
+  border-radius: 4px;
+}
+
+.error-title {
+  font-weight: 600;
+  color: #c33;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.error-content {
+  color: #c33;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.script-params-preview {
+  padding: 12px 16px;
+  background: #f9f9f9;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.params-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 13px;
+  color: #666;
+  font-weight: 500;
+}
+
+.params-header:hover {
+  color: #007bff;
+}
+
+.params-toggle {
+  font-size: 12px;
+  color: #999;
+}
+
+.params-content {
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.param-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.param-label {
+  font-size: 13px;
+  color: #333;
+  font-weight: 500;
+}
+
+.param-label .required {
+  color: #dc3545;
+  margin-left: 2px;
+}
+
+.param-label .param-desc {
+  color: #666;
+  font-weight: normal;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.param-input {
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 13px;
+  width: 100%;
+}
+
+.param-input:focus {
+  outline: none;
+  border-color: #007bff;
+}
+
+.param-input.error {
+  border-color: #dc3545;
+}
+
+.param-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.param-checkbox input[type="checkbox"] {
+  cursor: pointer;
 }
 </style>

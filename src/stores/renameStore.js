@@ -40,8 +40,20 @@ export const useRenameStore = defineStore('rename', {
   // 使用 console.log() 来输出日志，日志会在预览面板中显示
   // console.log('处理文件:', __fileName);
   
+  // 获取脚本参数（如果定义了参数）
+  // var prefix = __params && __params.prefix ? __params.prefix : '';
+  // var suffix = __params && __params.suffix ? __params.suffix : '';
+  // var maxLength = __params && __params.maxLength ? __params.maxLength : 255;
+  
   // 单个文件示例：
   return {[__filePath]: __fileName};
+  
+  // 使用参数的示例：
+  // var newName = prefix + __fileName + suffix;
+  // if (newName.length > maxLength) {
+  //   newName = newName.substring(0, maxLength);
+  // }
+  // return {[__filePath]: newName};
   
   // 批量重命名示例（文件夹场景）：
   // var result = {};
@@ -59,8 +71,9 @@ export const useRenameStore = defineStore('rename', {
     basePath: null, // 基础路径（如果选择的是文件夹）
     loading: false,
     error: null,
-    savedScripts: [], // 保存的脚本模板 [{ id, name, script, created_at, updated_at }]
+    savedScripts: [], // 保存的脚本模板 [{ id, name, script, created_at, updated_at, display_name, description, parameters }]
     currentScriptId: null, // 当前使用的脚本 ID
+    scriptParams: {}, // 脚本参数值 { scriptId: { paramName: value } }
   }),
 
   getters: {
@@ -175,10 +188,14 @@ export const useRenameStore = defineStore('rename', {
           ? [this.basePath] // 选择文件夹时，直接传递 basePath，不需要拼接
           : this.files.map((f) => f.path)
         console.log('[DEBUG] previewRename: basePath=', this.basePath, 'fileNames=', fileNames)
+        // 获取当前脚本的参数值
+        const params = this.getCurrentScriptParams()
+        
         const result = await invoke('preview_rename', {
           files: fileNames,
           script: this.script,
           basePath: null, // 选择文件夹时，不传递 basePath，因为 fileNames 已经是完整路径
+          params: params && Object.keys(params).length > 0 ? params : null,
         })
 
         this.previewResults = result.mappings.map(([original, new_name]) => ({
@@ -194,8 +211,11 @@ export const useRenameStore = defineStore('rename', {
         // 标记已执行过预览
         this.hasPreviewed = true
 
+        // 处理错误信息
         if (result.errors && result.errors.length > 0) {
-          this.error = result.errors.join('; ')
+          this.error = result.errors.join('\n')
+        } else {
+          this.error = null
         }
       } catch (error) {
         this.error = `预览失败: ${error}`
@@ -232,10 +252,14 @@ export const useRenameStore = defineStore('rename', {
         const fileNames = this.basePath 
           ? [this.basePath] // 选择文件夹时，直接传递 basePath，不需要拼接
           : this.files.map((f) => f.path)
+        
+        // 获取当前脚本的参数值
+        const params = this.getCurrentScriptParams()
         const results = await invoke('execute_rename', {
           files: fileNames,
           script: this.script,
           basePath: null, // 选择文件夹时，不传递 basePath，因为 fileNames 已经是完整路径
+          params: params && Object.keys(params).length > 0 ? params : null,
         })
 
         // 保存到撤销栈
@@ -396,9 +420,47 @@ export const useRenameStore = defineStore('rename', {
         this.currentScriptId = scriptId // 记录当前使用的脚本 ID
         this.previewResults = [] // 清空预览
         this.hasPreviewed = false // 重置预览状态
+        
+        // 初始化参数默认值
+        if (script.parameters && Array.isArray(script.parameters)) {
+          if (!this.scriptParams[scriptId]) {
+            this.scriptParams[scriptId] = {}
+          }
+          script.parameters.forEach((param) => {
+            if (param.default !== undefined && param.default !== null) {
+              this.scriptParams[scriptId][param.name] = param.default
+            } else if (param.required && this.scriptParams[scriptId][param.name] === undefined) {
+              // 必填参数但没有默认值，初始化为空字符串或0或false
+              if (param.type === 'number') {
+                this.scriptParams[scriptId][param.name] = 0
+              } else if (param.type === 'boolean') {
+                this.scriptParams[scriptId][param.name] = false
+              } else {
+                this.scriptParams[scriptId][param.name] = ''
+              }
+            }
+          })
+        }
+        
         return true
       }
       return false
+    },
+
+    // 设置脚本参数值
+    setScriptParam(scriptId, paramName, value) {
+      if (!this.scriptParams[scriptId]) {
+        this.scriptParams[scriptId] = {}
+      }
+      this.scriptParams[scriptId][paramName] = value
+    },
+
+    // 获取当前脚本的参数值
+    getCurrentScriptParams() {
+      if (!this.currentScriptId) {
+        return null
+      }
+      return this.scriptParams[this.currentScriptId] || {}
     },
 
     // 删除脚本模板

@@ -1,5 +1,6 @@
 use crate::js_engine::JsEngine;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use tauri::{State, Manager};
@@ -25,6 +26,7 @@ pub async fn preview_rename(
     files: Vec<String>,
     script: String,
     base_path: Option<String>,
+    params: Option<HashMap<String, serde_json::Value>>,
     engine: State<'_, JsEngine>,
 ) -> Result<PreviewResult, String> {
     if files.is_empty() {
@@ -70,7 +72,7 @@ pub async fn preview_rename(
     let mut all_logs = Vec::new();
 
     for file_path in &full_paths {
-        match engine.execute_rename_single(file_path, &script) {
+        match engine.execute_rename_single(file_path, &script, params.as_ref()) {
             Ok(mappings) => {
                 // 收集日志
                 let logs = engine.get_logs();
@@ -128,6 +130,7 @@ pub async fn execute_rename(
     files: Vec<String>,
     script: String,
     base_path: Option<String>,
+    params: Option<HashMap<String, serde_json::Value>>,
     engine: State<'_, JsEngine>,
 ) -> Result<Vec<RenameResult>, String> {
     if files.is_empty() {
@@ -163,7 +166,7 @@ pub async fn execute_rename(
     let mut all_mappings = Vec::new();
 
     for file_path in &full_paths {
-        match engine.execute_rename_single(file_path, &script) {
+        match engine.execute_rename_single(file_path, &script, params.as_ref()) {
             Ok(mappings) => {
                 all_mappings.extend(mappings);
             }
@@ -500,6 +503,19 @@ pub struct ScriptTemplate {
     pub updated_at: String,
     pub display_name: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<Vec<ScriptParameter>>,
+}
+
+/// 脚本参数结构
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScriptParameter {
+    pub name: String,                    // 参数名
+    #[serde(rename = "type")]
+    pub param_type: String,              // "string" | "number" | "boolean"
+    pub default: Option<serde_json::Value>, // 默认值
+    pub description: Option<String>,      // 参数描述
+    pub required: bool,                  // 是否必填
 }
 
 /// 脚本 Manifest 结构
@@ -507,6 +523,8 @@ pub struct ScriptTemplate {
 pub struct ScriptManifest {
     pub display_name: String,
     pub description: String,
+    #[serde(default)]
+    pub parameters: Option<Vec<ScriptParameter>>, // 脚本参数定义
 }
 
 /// 获取脚本目录路径
@@ -604,24 +622,28 @@ pub async fn load_saved_scripts(app: tauri::AppHandle) -> Result<Vec<ScriptTempl
                                                 
                                                 // 读取 Manifest 文件
                                                 let manifest_path = get_script_manifest_path(&app, &name)?;
-                                                let (display_name, description) = if manifest_path.exists() {
+                                                let (display_name, description, parameters) = if manifest_path.exists() {
                                                     match fs::read_to_string(&manifest_path) {
                                                         Ok(manifest_content) => {
                                                             match serde_json::from_str::<ScriptManifest>(&manifest_content) {
-                                                                Ok(manifest) => (Some(manifest.display_name), Some(manifest.description)),
+                                                                Ok(manifest) => (
+                                                                    Some(manifest.display_name),
+                                                                    Some(manifest.description),
+                                                                    manifest.parameters,
+                                                                ),
                                                                 Err(e) => {
                                                                     eprintln!("Failed to parse manifest file {}: {}", manifest_path.display(), e);
-                                                                    (None, None)
+                                                                    (None, None, None)
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
                                                             eprintln!("Failed to read manifest file {}: {}", manifest_path.display(), e);
-                                                            (None, None)
+                                                            (None, None, None)
                                                         }
                                                     }
                                                 } else {
-                                                    (None, None)
+                                                    (None, None, None)
                                                 };
                                                 
                                                 // 使用文件名作为 ID
@@ -635,6 +657,7 @@ pub async fn load_saved_scripts(app: tauri::AppHandle) -> Result<Vec<ScriptTempl
                                                     updated_at,
                                                     display_name,
                                                     description,
+                                                    parameters,
                                                 });
                                             }
                                             Err(e) => {
@@ -743,6 +766,7 @@ pub async fn save_script(
                 updated_at: now_str,
                 display_name: None,
                 description: None,
+                parameters: None,
             });
         }
     }
@@ -760,6 +784,7 @@ pub async fn save_script(
         updated_at: now_str,
         display_name: None,
         description: None,
+        parameters: None,
     })
 }
 
@@ -879,6 +904,7 @@ pub async fn open_script_manifest(
         let default_manifest = ScriptManifest {
             display_name: script_id.clone(),
             description: String::new(),
+            parameters: None,
         };
         let manifest_json = serde_json::to_string_pretty(&default_manifest)
             .map_err(|e| format!("Failed to serialize manifest: {}", e))?;
@@ -930,6 +956,7 @@ pub async fn save_script_manifest(
     let manifest = ScriptManifest {
         display_name: display_name.trim().to_string(),
         description: description.trim().to_string(),
+        parameters: None,
     };
     
     let manifest_json = serde_json::to_string_pretty(&manifest)

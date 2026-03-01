@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use rquickjs::{Context as JsContext, Function, Runtime as JsRuntime, Value as JsValue};
+use rquickjs::{Context as JsContext, Function, Object, Runtime as JsRuntime, Value as JsValue};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// 重命名结果：可以是单个文件的新名称，或批量重命名映射
@@ -32,8 +33,9 @@ impl JsEngine {
     /// 执行重命名脚本
     /// file_path: 文件或文件夹的完整路径
     /// filename: 文件或文件夹名称
+    /// params: 脚本参数
     /// 返回：单个文件的新名称，或批量重命名映射
-    pub fn execute_rename(&self, filename: &str, script: &str, file_path: Option<&str>) -> Result<RenameResult> {
+    pub fn execute_rename(&self, filename: &str, script: &str, file_path: Option<&str>, params: Option<&HashMap<String, JsonValue>>) -> Result<RenameResult> {
         if script.trim().is_empty() {
             anyhow::bail!("Script is empty");
         }
@@ -84,11 +86,55 @@ impl JsEngine {
             ctx.globals().set("__fileName", filename)
                 .context("Failed to set __fileName")?;
             
-            // 5. 调用 rename 函数
+            // 5. 注入参数到 JS 上下文（如果提供了参数）
+            if let Some(params) = params {
+                let params_obj = Object::new(ctx.clone())
+                    .context("Failed to create params object")?;
+                
+                for (key, value) in params {
+                    match value {
+                        JsonValue::String(s) => {
+                            params_obj.set(key.as_str(), s.as_str())
+                                .with_context(|| format!("Failed to set param '{}' as string", key))?;
+                        },
+                        JsonValue::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                params_obj.set(key.as_str(), i as i32)
+                                    .with_context(|| format!("Failed to set param '{}' as integer", key))?;
+                            } else if let Some(f) = n.as_f64() {
+                                params_obj.set(key.as_str(), f)
+                                    .with_context(|| format!("Failed to set param '{}' as float", key))?;
+                            }
+                        },
+                        JsonValue::Bool(b) => {
+                            params_obj.set(key.as_str(), *b)
+                                .with_context(|| format!("Failed to set param '{}' as boolean", key))?;
+                        },
+                        _ => {
+                            // 其他类型转换为字符串
+                            let s = serde_json::to_string(value)
+                                .unwrap_or_else(|_| "".to_string());
+                            params_obj.set(key.as_str(), s.as_str())
+                                .with_context(|| format!("Failed to set param '{}' as string", key))?;
+                        }
+                    }
+                }
+                
+                ctx.globals().set("__params", params_obj)
+                    .context("Failed to set __params in global scope")?;
+            } else {
+                // 如果没有参数，设置一个空对象
+                let empty_obj = Object::new(ctx.clone())
+                    .context("Failed to create empty params object")?;
+                ctx.globals().set("__params", empty_obj)
+                    .context("Failed to set empty __params in global scope")?;
+            }
+            
+            // 6. 调用 rename 函数
             let result: JsValue = rename_fn.call(())
                 .context("Failed to call rename function")?;
             
-            // 6. 将结果转换为 JSON 以便处理
+            // 7. 将结果转换为 JSON 以便处理
             // 要求用户脚本返回对象格式 {原始路径: 新路径}
             let serialize_script = r#"
                 (function() {
@@ -114,15 +160,15 @@ impl JsEngine {
             let json_str: String = ctx.eval(serialize_script)
                 .context("Failed to serialize JS result to JSON")?;
             
-            // 7. 日志已经在 log_collector 中收集（通过 console.log 调用）
+            // 8. 日志已经在 log_collector 中收集（通过 console.log 调用）
             // 在返回前检查日志数量（通过反射访问内部字段）
             // 注意：这里我们不能直接访问私有字段，所以先不检查
             
-            // 8. 解析 JSON
+            // 9. 解析 JSON
             let result_value: JsonValue = serde_json::from_str(&json_str)
                 .context("Failed to parse JS result as JSON")?;
             
-            // 9. 处理结果
+            // 10. 处理结果
             self.parse_rename_result_from_json(result_value)
         })?;
 
@@ -174,10 +220,12 @@ impl JsEngine {
 
     /// 执行重命名（对单个文件或文件夹）
     /// 如果返回批量结果，直接返回；如果返回单个结果，包装为批量结果
+    /// 执行单个文件的重命名（内部辅助函数）
     pub fn execute_rename_single(
         &self,
         file_path: &str,
         script: &str,
+        params: Option<&HashMap<String, JsonValue>>,
     ) -> Result<Vec<(String, String)>> {
         let path = std::path::Path::new(file_path);
         let filename = path.file_name()
@@ -185,7 +233,7 @@ impl JsEngine {
             .map(|s| s.to_string())
             .unwrap_or_else(|| file_path.to_string());
         
-        match self.execute_rename(&filename, script, Some(file_path)) {
+        match self.execute_rename(&filename, script, Some(file_path), params) {
             Ok(RenameResult::Single(new_name)) => {
                 // 检查是否是错误消息
                 if new_name.starts_with("ERROR:") {
