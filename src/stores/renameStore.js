@@ -21,12 +21,23 @@ async function getOpen() {
   }
 }
 
+// 从配置文件加载保存的脚本模板
+async function loadSavedScripts() {
+  try {
+    const invoke = await getInvoke()
+    return await invoke('load_saved_scripts')
+  } catch (error) {
+    console.error('Failed to load saved scripts:', error)
+    return []
+  }
+}
+
 export const useRenameStore = defineStore('rename', {
   state: () => ({
     files: [], // 文件列表 [{ name, path, size, modified }]
-    script: `export default function rename(filename) {
-  // 示例：将文件名转换为小写
-  return filename.toLowerCase();
+    script: `function rename() {
+  // 示例：返回原文件名（不进行修改）
+  return __fileName;
 }`,
     previewResults: [], // 预览结果 [{ original, new_name, error }]
     history: [], // 历史记录 [{ timestamp, files, script, results }]
@@ -34,6 +45,7 @@ export const useRenameStore = defineStore('rename', {
     basePath: null, // 基础路径（如果选择的是文件夹）
     loading: false,
     error: null,
+    savedScripts: [], // 保存的脚本模板 [{ id, name, script, created_at, updated_at }]
   }),
 
   getters: {
@@ -44,6 +56,10 @@ export const useRenameStore = defineStore('rename', {
   },
 
   actions: {
+    // 初始化：加载保存的脚本
+    async initSavedScripts() {
+      this.savedScripts = await loadSavedScripts()
+    },
     // 选择文件
     async selectFiles() {
       try {
@@ -318,6 +334,84 @@ export const useRenameStore = defineStore('rename', {
     // 清空错误
     clearError() {
       this.error = null
+    },
+
+    // 保存脚本模板
+    async saveScript(name, script, scriptId = null) {
+      try {
+        const invoke = await getInvoke()
+        const saved = await invoke('save_script', {
+          name,
+          script,
+          scriptId,
+        })
+        
+        // 更新本地状态
+        const index = this.savedScripts.findIndex((s) => s.id === saved.id)
+        if (index !== -1) {
+          this.savedScripts[index] = saved
+        } else {
+          this.savedScripts.push(saved)
+        }
+        
+        return true
+      } catch (error) {
+        this.error = `保存脚本失败: ${error}`
+        console.error(error)
+        return false
+      }
+    },
+
+    // 加载脚本模板
+    loadScript(scriptId) {
+      const script = this.savedScripts.find((s) => s.id === scriptId)
+      if (script) {
+        this.script = script.script
+        this.previewResults = [] // 清空预览
+        return true
+      }
+      return false
+    },
+
+    // 删除脚本模板
+    async deleteScript(scriptId) {
+      try {
+        const invoke = await getInvoke()
+        await invoke('delete_script', { scriptId })
+        
+        // 更新本地状态
+        const index = this.savedScripts.findIndex((s) => s.id === scriptId)
+        if (index !== -1) {
+          this.savedScripts.splice(index, 1)
+        }
+        
+        return true
+      } catch (error) {
+        this.error = `删除脚本失败: ${error}`
+        console.error(error)
+        return false
+      }
+    },
+
+    // 重命名脚本模板
+    async renameScript(scriptId, newName) {
+      try {
+        const invoke = await getInvoke()
+        await invoke('rename_script', { scriptId, newName })
+        
+        // 更新本地状态
+        const script = this.savedScripts.find((s) => s.id === scriptId)
+        if (script) {
+          script.name = newName.trim()
+          script.updated_at = new Date().toISOString()
+        }
+        
+        return true
+      } catch (error) {
+        this.error = `重命名脚本失败: ${error}`
+        console.error(error)
+        return false
+      }
     },
   },
 })

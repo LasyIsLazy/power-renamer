@@ -1,7 +1,8 @@
 use crate::js_engine::JsEngine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::State;
+use std::fs;
+use tauri::{State, Manager};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RenameResult {
@@ -38,45 +39,31 @@ pub async fn preview_rename(
         });
     }
 
-    // 提取文件名（如果传入的是完整路径）
-    let file_names: Vec<String> = files
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| f.clone())
-        })
-        .collect();
+    // 对每个选择的文件/文件夹调用一次 rename
+    let mut all_mappings = Vec::new();
+    let mut errors = Vec::new();
 
-    match engine.execute_rename_batch(&file_names, &script) {
-        Ok(mappings) => {
-            let mut errors = Vec::new();
-            // 映射回原始路径
-            // mappings 是 (文件名, 新文件名) 的列表
-            // files 是完整路径列表
-            let valid_mappings: Vec<(String, String)> = mappings
-                .into_iter()
-                .zip(files.iter())
-                .filter_map(|((_old_name, new_name), original_path)| {
+    for file_path in &files {
+        match engine.execute_rename_single(file_path, &script) {
+            Ok(mappings) => {
+                for (original_path, new_name) in mappings {
                     if new_name.starts_with("ERROR:") {
                         errors.push(format!("{}: {}", original_path, new_name));
-                        None
                     } else {
-                        // original_path 是完整路径，new_name 是 JS 引擎返回的新文件名
-                        Some((original_path.clone(), new_name))
+                        all_mappings.push((original_path, new_name));
                     }
-                })
-                .collect();
-
-            Ok(PreviewResult {
-                mappings: valid_mappings,
-                errors,
-            })
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", file_path, e));
+            }
         }
-        Err(e) => Err(format!("执行脚本失败: {}", e)),
     }
+
+    Ok(PreviewResult {
+        mappings: all_mappings,
+        errors,
+    })
 }
 
 /// 执行重命名操作
@@ -95,34 +82,38 @@ pub async fn execute_rename(
         return Err("脚本不能为空".to_string());
     }
 
-    // 提取文件名（如果传入的是完整路径）
-    let file_names: Vec<String> = files
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| f.clone())
-        })
-        .collect();
+    // 构建完整路径列表（如果有 base_path，需要拼接）
+    let full_paths: Vec<String> = if let Some(base) = &base_path {
+        files
+            .iter()
+            .map(|f| {
+                let base_path = PathBuf::from(base);
+                base_path.join(f).to_string_lossy().to_string()
+            })
+            .collect()
+    } else {
+        files.clone()
+    };
 
-    // 直接使用引擎获取预览结果
-    let mappings = engine.execute_rename_batch(&file_names, &script)
-        .map_err(|e| format!("执行脚本失败: {}", e))?;
+    // 对每个选择的文件/文件夹调用一次 rename
+    let mut all_mappings = Vec::new();
 
-    // 映射回原始路径
-    let mappings: Vec<(String, String)> = mappings
-        .into_iter()
-        .zip(files.iter())
-        .map(|((_old_name, new_name), original_path)| {
-            (original_path.clone(), new_name)
-        })
-        .collect();
+    for file_path in &full_paths {
+        match engine.execute_rename_single(file_path, &script) {
+            Ok(mappings) => {
+                all_mappings.extend(mappings);
+            }
+            Err(e) => {
+                // 如果失败，记录错误但继续处理其他文件
+                eprintln!("Error processing {}: {}", file_path, e);
+                all_mappings.push((file_path.clone(), format!("ERROR: {}", e)));
+            }
+        }
+    }
 
     let mut results = Vec::new();
 
-    for (original, new_name) in mappings {
+    for (original, new_name) in all_mappings {
         // 跳过错误结果
         if new_name.starts_with("ERROR:") {
             results.push(RenameResult {
@@ -133,6 +124,7 @@ pub async fn execute_rename(
             });
             continue;
         }
+        
         // 验证新文件名
         if !is_valid_filename(&new_name) {
             results.push(RenameResult {
@@ -179,13 +171,21 @@ pub async fn execute_rename(
             }
             joined
         } else {
-            // 当 base_path 为 None 时，从原始路径提取目录，然后与新文件名组合
-            let old_path_buf = PathBuf::from(&original);
-            if let Some(parent) = old_path_buf.parent() {
-                parent.join(&new_name)
+            // 当 base_path 为 None 时，new_name 可能是完整路径或只是文件名
+            // 检查 new_name 是否是绝对路径
+            let new_path_buf = PathBuf::from(&new_name);
+            if new_path_buf.is_absolute() {
+                // 如果已经是完整路径，直接使用
+                new_path_buf
             } else {
-                // 如果没有父目录，直接使用新文件名
-                PathBuf::from(&new_name)
+                // 如果只是文件名，从原始路径提取目录，然后与新文件名组合
+                let old_path_buf = PathBuf::from(&original);
+                if let Some(parent) = old_path_buf.parent() {
+                    parent.join(&new_name)
+                } else {
+                    // 如果没有父目录，直接使用新文件名
+                    PathBuf::from(&new_name)
+                }
             }
         };
 
@@ -280,6 +280,195 @@ pub async fn get_folder_files(folder_path: String) -> Result<Vec<String>, String
 
     files.sort();
     Ok(files)
+}
+
+/// 脚本模板结构
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScriptTemplate {
+    pub id: String,
+    pub name: String,
+    pub script: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 获取配置文件路径
+fn get_config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app.path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    
+    // 确保目录存在
+    fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+    
+    Ok(app_data_dir.join("scripts.json"))
+}
+
+/// 获取配置文件路径（用于显示给用户）
+#[tauri::command]
+pub async fn get_config_path_display(app: tauri::AppHandle) -> Result<String, String> {
+    let config_path = get_config_path(&app)?;
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+/// 加载保存的脚本模板
+#[tauri::command]
+pub async fn load_saved_scripts(app: tauri::AppHandle) -> Result<Vec<ScriptTemplate>, String> {
+    let config_path = get_config_path(&app)?;
+    
+    if !config_path.exists() {
+        return Ok(vec![]);
+    }
+    
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    
+    let scripts: Vec<ScriptTemplate> = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+    
+    Ok(scripts)
+}
+
+/// 保存脚本模板
+#[tauri::command]
+pub async fn save_script(
+    app: tauri::AppHandle,
+    name: String,
+    script: String,
+    script_id: Option<String>,
+) -> Result<ScriptTemplate, String> {
+    if name.trim().is_empty() {
+        return Err("脚本名称不能为空".to_string());
+    }
+    
+    if script.trim().is_empty() {
+        return Err("脚本内容不能为空".to_string());
+    }
+    
+    let config_path = get_config_path(&app)?;
+    let mut scripts: Vec<ScriptTemplate> = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse config file: {}", e))?
+    } else {
+        vec![]
+    };
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    // 检查名称是否已存在（排除当前编辑的脚本）
+    let check_id = script_id.as_ref().map(|s| s.as_str()).unwrap_or("");
+    if scripts.iter().any(|s| s.name == name.trim() && s.id != check_id) {
+        return Err("脚本名称已存在".to_string());
+    }
+    
+    if let Some(ref id) = script_id {
+        // 更新现有脚本
+        if let Some(existing) = scripts.iter_mut().find(|s| s.id == *id) {
+            existing.name = name.trim().to_string();
+            existing.script = script.trim().to_string();
+            existing.updated_at = now.clone();
+            
+            let updated = existing.clone();
+            save_scripts_to_file(&config_path, &scripts)?;
+            return Ok(updated);
+        }
+    }
+    
+    // 创建新脚本
+    let new_script = ScriptTemplate {
+        id: script_id.unwrap_or_else(|| chrono::Utc::now().timestamp_millis().to_string()),
+        name: name.trim().to_string(),
+        script: script.trim().to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    
+    scripts.push(new_script.clone());
+    save_scripts_to_file(&config_path, &scripts)?;
+    
+    Ok(new_script)
+}
+
+/// 删除脚本模板
+#[tauri::command]
+pub async fn delete_script(
+    app: tauri::AppHandle,
+    script_id: String,
+) -> Result<(), String> {
+    let config_path = get_config_path(&app)?;
+    
+    if !config_path.exists() {
+        return Ok(());
+    }
+    
+    let mut scripts: Vec<ScriptTemplate> = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config file: {}", e))
+        .and_then(|content| {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse config file: {}", e))
+        })?;
+    
+    let initial_len = scripts.len();
+    scripts.retain(|s| s.id != script_id);
+    
+    if scripts.len() < initial_len {
+        save_scripts_to_file(&config_path, &scripts)?;
+    }
+    
+    Ok(())
+}
+
+/// 重命名脚本模板
+#[tauri::command]
+pub async fn rename_script(
+    app: tauri::AppHandle,
+    script_id: String,
+    new_name: String,
+) -> Result<(), String> {
+    if new_name.trim().is_empty() {
+        return Err("脚本名称不能为空".to_string());
+    }
+    
+    let config_path = get_config_path(&app)?;
+    
+    if !config_path.exists() {
+        return Err("配置文件不存在".to_string());
+    }
+    
+    let mut scripts: Vec<ScriptTemplate> = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config file: {}", e))
+        .and_then(|content| {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse config file: {}", e))
+        })?;
+    
+    // 检查名称是否已存在
+    if scripts.iter().any(|s| s.name == new_name.trim() && s.id != script_id) {
+        return Err("脚本名称已存在".to_string());
+    }
+    
+    if let Some(script) = scripts.iter_mut().find(|s| s.id == script_id) {
+        script.name = new_name.trim().to_string();
+        script.updated_at = chrono::Utc::now().to_rfc3339();
+        save_scripts_to_file(&config_path, &scripts)?;
+        Ok(())
+    } else {
+        Err("脚本不存在".to_string())
+    }
+}
+
+/// 保存脚本列表到文件
+fn save_scripts_to_file(path: &PathBuf, scripts: &[ScriptTemplate]) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(scripts)
+        .map_err(|e| format!("Failed to serialize scripts: {}", e))?;
+    
+    fs::write(path, content)
+        .map_err(|e| format!("Failed to write config file: {}", e))?;
+    
+    Ok(())
 }
 
 /// 验证文件名是否合法

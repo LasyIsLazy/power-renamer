@@ -30,6 +30,7 @@
 </template>
 
 <script setup>
+import { onMounted } from 'vue'
 import { useRenameStore } from './stores/renameStore'
 import FileSelector from './components/FileSelector.vue'
 import ScriptEditor from './components/ScriptEditor.vue'
@@ -37,6 +38,11 @@ import PreviewPanel from './components/PreviewPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 
 const store = useRenameStore()
+
+// 初始化时加载保存的脚本
+onMounted(() => {
+  store.initSavedScripts()
+})
 </script>
 
 <style scoped>

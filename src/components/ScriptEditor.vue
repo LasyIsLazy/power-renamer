@@ -14,14 +14,16 @@
         v-model="localScript"
         @input="handleInput"
         class="code-editor"
-        placeholder="function rename(filename) {&#10;  // 在这里编写你的重命名逻辑&#10;  return filename;&#10;}"
+        placeholder="function rename() {&#10;  // 使用全局变量 __filePath 和 __fileName&#10;  // 使用 __utils.path, __utils.md5, __utils.fs 访问工具函数&#10;  // 返回字符串（单个文件）或对象/数组（批量重命名）&#10;  return __fileName;&#10;}"
       ></textarea>
     </div>
 
     <div class="footer">
       <div class="hint">
-        <p>提示：脚本必须定义一个 <code>rename(filename)</code> 函数</p>
-        <p>函数接收文件名（字符串），返回新的文件名（字符串）</p>
+        <p>提示：脚本必须直接定义 <code>function rename()</code> 函数</p>
+        <p>函数无参数，使用全局变量 <code>__filePath</code> 和 <code>__fileName</code></p>
+        <p>使用 <code>__utils.path</code>, <code>__utils.md5</code>, <code>__utils.fs</code> 访问工具函数</p>
+        <p>返回字符串（单个文件）或对象/数组（批量重命名，用于文件夹场景）</p>
       </div>
     </div>
   </div>
@@ -51,27 +53,51 @@ const handleInput = () => {
 
 const loadTemplate = () => {
   const templates = [
-    `function rename(filename) {
+    `function rename() {
   // 转换为小写
-  return filename.toLowerCase();
+  var dir = __utils.path.dirname(__filePath);
+  var newName = __fileName.toLowerCase();
+  return __utils.path.join(dir, newName);
 }`,
-    `function rename(filename) {
+    `function rename() {
   // 移除空格
-  return filename.replace(/\\s+/g, '_');
+  var dir = __utils.path.dirname(__filePath);
+  var newName = __fileName.replace(/\\s+/g, '_');
+  return __utils.path.join(dir, newName);
 }`,
-    `function rename(filename) {
+    `function rename() {
   // 添加前缀
-  return 'IMG_' + filename;
+  var dir = __utils.path.dirname(__filePath);
+  var newName = 'IMG_' + __fileName;
+  return __utils.path.join(dir, newName);
 }`,
-    `function rename(filename) {
-  // 添加序号
-  const ext = filename.substring(filename.lastIndexOf('.'));
-  const name = filename.substring(0, filename.lastIndexOf('.'));
-  return name + '_' + Date.now() + ext;
+    `function rename() {
+  // 按 MD5 重命名
+  if (__utils.path.isFile(__filePath)) {
+    var ext = __utils.path.extname(__filePath);
+    var hash = __utils.md5.file(__filePath);
+    var dir = __utils.path.dirname(__filePath);
+    return __utils.path.join(dir, hash + ext);
+  }
+  return __fileName;
 }`,
-    `function rename(filename) {
-  // 替换特定字符
-  return filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    `function rename() {
+  // 文件夹批量重命名示例
+  if (__utils.path.isDir(__filePath)) {
+    var files = __utils.fs.readDirFiles(__filePath);
+    var result = {};
+    for (var i = 0; i < files.length; i++) {
+      var filePath = files[i];
+      if (__utils.path.isFile(filePath)) {
+        var ext = __utils.path.extname(filePath);
+        var hash = __utils.md5.file(filePath);
+        var dir = __utils.path.dirname(filePath);
+        result[filePath] = __utils.path.join(dir, hash + ext);
+      }
+    }
+    return result;
+  }
+  return __fileName;
 }`,
   ]
 
