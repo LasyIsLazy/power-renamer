@@ -18,9 +18,7 @@
     <div
       v-if="!store.hasFiles"
       class="drop-zone"
-      @drop="handleDrop"
-      @dragover.prevent
-      @dragenter.prevent
+      :class="{ 'drop-zone-active': isDragOver }"
     >
       <div class="drop-zone-content">
         <p>拖拽文件或文件夹到这里</p>
@@ -55,9 +53,12 @@
 </template>
 
 <script setup>
+import { onMounted, onUnmounted, ref } from 'vue'
 import { useRenameStore } from '../stores/renameStore'
 
 const store = useRenameStore()
+const isDragOver = ref(false)
+let unlistenDragDrop = null
 
 const selectFiles = () => {
   store.selectFiles()
@@ -67,23 +68,35 @@ const selectFolder = () => {
   store.selectFolder()
 }
 
-const handleDrop = async (event) => {
-  event.preventDefault()
-  
+onMounted(async () => {
   try {
-    // 使用 Tauri 的文件 API 处理拖拽
-    const files = event.dataTransfer.files
-    if (files && files.length > 0) {
-      // 对于拖拽的文件，使用文件选择功能
-      // 注意：浏览器中的拖拽可能无法直接获取完整路径
-      // 这里简化处理，提示用户使用文件选择按钮
-      store.selectFiles()
-    }
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    const appWindow = getCurrentWindow()
+    unlistenDragDrop = await appWindow.onDragDropEvent((event) => {
+      const { type } = event.payload
+      if (type === 'over') {
+        isDragOver.value = true
+      } else if (type === 'drop') {
+        isDragOver.value = false
+        const paths = event.payload.paths
+        if (paths && paths.length > 0) {
+          store.addDroppedPaths(paths)
+        }
+      } else {
+        isDragOver.value = false
+      }
+    })
   } catch (error) {
-    console.error('处理拖拽失败:', error)
-    store.error = '拖拽文件失败，请使用文件选择按钮'
+    console.warn('Tauri 拖放 API 不可用:', error)
   }
-}
+})
+
+onUnmounted(() => {
+  if (unlistenDragDrop) {
+    unlistenDragDrop()
+    unlistenDragDrop = null
+  }
+})
 </script>
 
 <style scoped>
@@ -162,16 +175,19 @@ const handleDrop = async (event) => {
   margin: 16px;
   border-radius: 8px;
   background: #fafafa;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s, background-color 0.2s;
 }
 
-.drop-zone:hover {
+.drop-zone:hover,
+.drop-zone-active {
   border-color: #007bff;
+  background: #f0f7ff;
 }
 
 .drop-zone-content {
   text-align: center;
   color: #666;
+  pointer-events: none;
 }
 
 .drop-zone-content p {

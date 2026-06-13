@@ -1,9 +1,10 @@
 use crate::js_engine::JsEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
-use tauri::{State, Manager};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use tauri::{Manager, State};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RenameResult {
@@ -17,12 +18,99 @@ pub struct RenameResult {
 pub struct PreviewResult {
     pub mappings: Vec<(String, String)>,
     pub errors: Vec<String>,
-    pub logs: Vec<String>, // 脚本执行时的 __utils.log.log 输出
+    pub logs: Vec<String>, // 脚本执行时的 console.log 输出
+}
+
+fn get_logs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+
+    let logs_dir = app_data_dir.join("logs");
+    fs::create_dir_all(&logs_dir)
+        .map_err(|e| format!("Failed to create logs directory: {}", e))?;
+
+    Ok(logs_dir)
+}
+
+fn today_log_file(logs_dir: &Path) -> PathBuf {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    logs_dir.join(format!("{}.log", date))
+}
+
+fn format_log_entry(context: &str, message: &str) -> String {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let sanitized = message.replace(['\n', '\r'], " ");
+    format!("[{}] [{}] {}", timestamp, context, sanitized)
+}
+
+fn persist_script_logs(
+    app: &tauri::AppHandle,
+    context: &str,
+    logs: &[String],
+) -> Result<(), String> {
+    if logs.is_empty() {
+        return Ok(());
+    }
+
+    let logs_dir = get_logs_dir(app)?;
+    let log_file = today_log_file(&logs_dir);
+    let mut content = String::new();
+    for log in logs {
+        content.push_str(&format_log_entry(context, log));
+        content.push('\n');
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .map_err(|e| format!("Failed to open log file: {}", e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write log file: {}", e))?;
+
+    Ok(())
+}
+
+/// 加载脚本日志（默认加载当天，可按 YYYY-MM-DD 指定日期）
+#[tauri::command]
+pub async fn load_script_logs(
+    app: tauri::AppHandle,
+    date: Option<String>,
+) -> Result<Vec<String>, String> {
+    let logs_dir = get_logs_dir(&app)?;
+    let log_file = if let Some(d) = date {
+        logs_dir.join(format!("{}.log", d))
+    } else {
+        today_log_file(&logs_dir)
+    };
+
+    if !log_file.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = fs::read_to_string(&log_file)
+        .map_err(|e| format!("Failed to read log file: {}", e))?;
+
+    Ok(content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect())
+}
+
+/// 获取日志目录路径（用于显示给用户）
+#[tauri::command]
+pub async fn get_logs_dir_display(app: tauri::AppHandle) -> Result<String, String> {
+    let logs_dir = get_logs_dir(&app)?;
+    Ok(logs_dir.to_string_lossy().to_string())
 }
 
 /// 预览重命名结果（不实际重命名）
 #[tauri::command]
 pub async fn preview_rename(
+    app: tauri::AppHandle,
     files: Vec<String>,
     script: String,
     base_path: Option<String>,
@@ -63,8 +151,18 @@ pub async fn preview_rename(
     } else {
         files.clone()
     };
-    
-    eprintln!("[DEBUG] preview_rename: base_path={:?}, files={:?}, full_paths={:?}", base_path, files, full_paths);
+
+    // 执行前校验：所有路径必须存在，否则立即返回错误并终止
+    for p in &full_paths {
+        let path_buf = PathBuf::from(p);
+        if !path_buf.exists() {
+            return Ok(PreviewResult {
+                mappings: vec![],
+                errors: vec![format!("路径不存在: {}", p)],
+                logs: vec![],
+            });
+        }
+    }
 
     // 对每个选择的文件/文件夹调用一次 rename
     let mut all_mappings = Vec::new();
@@ -76,12 +174,14 @@ pub async fn preview_rename(
             Ok(mappings) => {
                 // 收集日志
                 let logs = engine.get_logs();
-                eprintln!("[DEBUG] preview_rename: Collected {} logs from engine", logs.len());
                 all_logs.extend(logs);
-                
+
+                let mut has_error = false;
                 for (original_path, new_name) in mappings {
                     if new_name.starts_with("ERROR:") {
                         errors.push(format!("{}: {}", original_path, new_name));
+                        has_error = true;
+                        break; // 单个文件内部错误，不再处理该文件的其余映射
                     } else {
                         // 统一格式：如果 original_path 是完整路径，new_name 也应该是完整路径
                         // 如果 new_name 是相对路径或只是文件名，需要转换为完整路径
@@ -110,11 +210,19 @@ pub async fn preview_rename(
                         }
                     }
                 }
+                if has_error {
+                    break; // 出错时终止后续文件处理
+                }
             }
             Err(e) => {
                 errors.push(format!("{}: {}", file_path, e));
+                break; // 出错时终止后续文件处理
             }
         }
+    }
+
+    if let Err(e) = persist_script_logs(&app, "preview", &all_logs) {
+        eprintln!("Failed to persist script logs: {}", e);
     }
 
     Ok(PreviewResult {
@@ -127,6 +235,7 @@ pub async fn preview_rename(
 /// 执行重命名操作
 #[tauri::command]
 pub async fn execute_rename(
+    app: tauri::AppHandle,
     files: Vec<String>,
     script: String,
     base_path: Option<String>,
@@ -159,23 +268,40 @@ pub async fn execute_rename(
     } else {
         files.clone()
     };
-    
-    eprintln!("[DEBUG] execute_rename: base_path={:?}, files={:?}, full_paths={:?}", base_path, files, full_paths);
+
+    // 执行前校验：所有路径必须存在，否则立即返回错误并终止
+    for p in &full_paths {
+        let path_buf = PathBuf::from(p);
+        if !path_buf.exists() {
+            return Err(format!("路径不存在: {}", p));
+        }
+    }
 
     // 对每个选择的文件/文件夹调用一次 rename
     let mut all_mappings = Vec::new();
+    let mut all_logs = Vec::new();
 
     for file_path in &full_paths {
         match engine.execute_rename_single(file_path, &script, params.as_ref()) {
             Ok(mappings) => {
+                let logs = engine.get_logs();
+                all_logs.extend(logs);
+
+                let has_error = mappings.iter().any(|(_, new_name)| new_name.starts_with("ERROR:"));
                 all_mappings.extend(mappings);
+                if has_error {
+                    break; // 出错时终止后续文件处理
+                }
             }
             Err(e) => {
-                // 如果失败，记录错误但继续处理其他文件
-                eprintln!("Error processing {}: {}", file_path, e);
                 all_mappings.push((file_path.clone(), format!("ERROR: {}", e)));
+                break; // 出错时终止后续文件处理
             }
         }
+    }
+
+    if let Err(e) = persist_script_logs(&app, "execute", &all_logs) {
+        eprintln!("Failed to persist script logs: {}", e);
     }
 
     let mut results = Vec::new();

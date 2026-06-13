@@ -75,7 +75,9 @@
       <p v-else class="no-changes">✓ 没有文件需要重命名，所有文件名保持不变</p>
       <!-- 即使没有预览结果，也显示日志 -->
       <div class="script-logs" style="margin-top: 16px;">
-        <div class="logs-header">脚本日志:</div>
+        <div class="logs-header" :title="logsDir ? `日志目录: ${logsDir}` : ''">
+          脚本日志<span v-if="logsDir" class="logs-persist-hint">（已持久化）</span>
+        </div>
         <div class="logs-content">
           <div v-if="store.scriptLogs && store.scriptLogs.length > 0">
             <div v-for="(log, index) in store.scriptLogs" :key="index" class="log-item">
@@ -90,7 +92,9 @@
     <div v-else class="preview-content">
       <!-- 固定显示脚本日志区域 -->
       <div class="script-logs">
-        <div class="logs-header">脚本日志:</div>
+        <div class="logs-header" :title="logsDir ? `日志目录: ${logsDir}` : ''">
+          脚本日志<span v-if="logsDir" class="logs-persist-hint">（已持久化）</span>
+        </div>
         <div class="logs-content">
           <div v-if="store.scriptLogs && store.scriptLogs.length > 0">
             <div v-for="(log, index) in store.scriptLogs" :key="index" class="log-item">
@@ -101,30 +105,54 @@
         </div>
       </div>
 
-      <!-- 显示预览结果 -->
-      <div
-        v-for="(result, index) in store.previewResults"
-        :key="index"
-        class="preview-item"
-        :class="{ error: result.error }"
-      >
-        <div class="preview-info">
-          <div class="original">
-            <span class="label">原文件名:</span>
-            <span class="value">{{ result.original }}</span>
-          </div>
-          <div class="arrow">→</div>
-          <div class="new">
-            <span class="label">新文件名:</span>
-            <span class="value" :class="{ changed: hasChanged(result) }">
-              {{ result.new_name }}
-            </span>
-          </div>
-        </div>
-        <div v-if="result.error" class="error-message">
-          {{ result.error }}
+      <!-- 预览结果：数量多时用文件夹树，否则用平铺列表 -->
+      <div v-if="useTreeView" class="preview-tree-wrap">
+        <div
+          v-for="(node, idx) in previewTreeRoot.children"
+          :key="'tree-' + idx + '-' + node.key"
+          class="tree-node-wrap"
+        >
+          <PreviewTreeNode
+            :node="node"
+            :depth="0"
+            :expanded-keys="expandedKeys"
+            :get-path-parts="getPathParts"
+            :has-changed="hasChanged"
+            @toggle="toggleTreeExpand(node.key)"
+          />
         </div>
       </div>
+      <template v-else>
+        <div
+          v-for="(result, index) in store.previewResults"
+          :key="index"
+          class="preview-item"
+          :class="{ error: result.error }"
+        >
+          <div class="preview-info">
+            <div class="original">
+              <span class="label">原路径:</span>
+              <span class="value path-value">
+                <template v-for="(part, i) in getPathParts(result.original, result.new_name).original" :key="'o-' + i">
+                  <span :class="part.type === 'common' ? 'path-common' : 'path-diff path-diff-removed'">{{ part.text }}</span>
+                </template>
+              </span>
+            </div>
+            <div class="arrow">→</div>
+            <div class="new">
+              <span class="label">新路径:</span>
+              <span class="value path-value" :class="{ changed: hasChanged(result) }">
+                <template v-for="(part, i) in getPathParts(result.original, result.new_name).new" :key="'n-' + i">
+                  <span :class="part.type === 'common' ? 'path-common' : 'path-diff path-diff-added'">{{ part.text }}</span>
+                </template>
+              </span>
+            </div>
+          </div>
+          <div v-if="result.error" class="error-message">
+            {{ result.error }}
+          </div>
+        </div>
+      </template>
     </div>
 
     <div v-if="store.hasPreviewed && store.previewResults.length > 0" class="footer">
@@ -146,11 +174,91 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRenameStore } from '../stores/renameStore'
+import PreviewTreeNode from './PreviewTreeNode.vue'
 
 const store = useRenameStore()
 const expandedParamsPreview = ref(false)
+const logsDir = ref('')
+
+onMounted(async () => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    logsDir.value = await invoke('get_logs_dir_display')
+  } catch {
+    // 非 Tauri 环境忽略
+  }
+})
+
+/** 超过该数量时预览以文件夹树展示 */
+const TREE_VIEW_THRESHOLD = 10
+
+const useTreeView = computed(() => store.previewResults.length >= TREE_VIEW_THRESHOLD)
+
+const expandedKeys = ref(new Set())
+
+function toggleTreeExpand(key) {
+  const next = new Set(expandedKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedKeys.value = next
+}
+
+/** 树视图下默认展开第一层目录 */
+watch(
+  () => store.previewResults.length,
+  () => {
+    if (useTreeView.value) {
+      const keys = new Set()
+      for (const node of previewTreeRoot.value.children) {
+        if (node.type === 'dir') keys.add(node.key)
+      }
+      expandedKeys.value = keys
+    }
+  },
+  { immediate: true }
+)
+
+/** 将预览结果按路径构建为树 { name, type: 'dir'|'file', key, children?, result? } */
+const previewTreeRoot = computed(() => {
+  const sep = /[/\\]/
+  const root = { name: '', type: 'dir', key: '__root__', children: [] }
+  for (const r of store.previewResults) {
+    const segments = r.original.split(sep).filter(Boolean)
+    if (segments.length === 0) {
+      root.children.push({ type: 'file', name: r.original, key: r.original, result: r })
+      continue
+    }
+    const fileName = segments.pop()
+    const sepChar = r.original.includes('\\') ? '\\' : '/'
+    let current = root
+    let pathSoFar = ''
+    for (const seg of segments) {
+      const nextPath = pathSoFar ? pathSoFar + sepChar + seg : seg
+      let child = current.children.find((c) => c.name === seg && c.type === 'dir')
+      if (!child) {
+        child = { type: 'dir', name: seg, key: nextPath, children: [] }
+        current.children.push(child)
+      }
+      current = child
+      pathSoFar = nextPath
+    }
+    current.children.push({ type: 'file', name: fileName, key: r.original, result: r })
+  }
+  // 目录按名称排序，文件保持顺序
+  function sortChildren(n) {
+    if (n.children) {
+      n.children.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+      })
+      n.children.forEach(sortChildren)
+    }
+  }
+  sortChildren(root)
+  return root
+})
 
 // 获取当前脚本
 const currentScript = computed(() => {
@@ -211,6 +319,32 @@ const changedCount = computed(() => {
 
 const hasChanged = (result) => {
   return result.original !== result.new_name && !result.error
+}
+
+/** 路径按分隔符拆成段，用于高亮展示差异 */
+const pathSeparator = /[/\\]/
+function getPathParts(original, newName) {
+  const a = original.split(pathSeparator).filter(Boolean)
+  const b = newName.split(pathSeparator).filter(Boolean)
+  let i = 0
+  while (i < a.length && i < b.length && a[i] === b[i]) i++
+  const sep = original.includes('\\') ? '\\' : '/'
+  const commonPath = a.slice(0, i).join(sep)
+  const originalTail = a.slice(i).join(sep)
+  const newTail = b.slice(i).join(sep)
+
+  const originalParts = []
+  if (commonPath) originalParts.push({ type: 'common', text: commonPath + (originalTail ? sep : '') })
+  if (originalTail) originalParts.push({ type: 'diff', text: originalTail })
+
+  const newParts = []
+  if (commonPath) newParts.push({ type: 'common', text: commonPath + (newTail ? sep : '') })
+  if (newTail) newParts.push({ type: 'diff', text: newTail })
+
+  return {
+    original: originalParts.length ? originalParts : [{ type: 'common', text: original }],
+    new: newParts.length ? newParts : [{ type: 'common', text: newName }],
+  }
 }
 </script>
 
@@ -304,6 +438,16 @@ const hasChanged = (result) => {
   padding: 8px;
 }
 
+.preview-tree-wrap {
+  margin-top: 8px;
+  padding: 8px;
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
 .preview-item {
   padding: 12px;
   margin-bottom: 8px;
@@ -352,6 +496,30 @@ const hasChanged = (result) => {
 .value.changed {
   color: #28a745;
   font-weight: 600;
+}
+
+.path-value {
+  display: inline;
+}
+
+.path-common {
+  color: #666;
+}
+
+.path-diff {
+  font-weight: 600;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
+.path-diff-removed {
+  background: rgba(220, 53, 69, 0.15);
+  color: #c82333;
+}
+
+.path-diff-added {
+  background: rgba(40, 167, 69, 0.2);
+  color: #1e7e34;
 }
 
 .arrow {
@@ -403,6 +571,12 @@ const hasChanged = (result) => {
   font-weight: 600;
   color: #495057;
   margin-bottom: 8px;
+}
+
+.logs-persist-hint {
+  margin-left: 4px;
+  font-weight: 400;
+  color: #868e96;
 }
 
 .logs-content {

@@ -39,9 +39,10 @@ import HistoryPanel from './components/HistoryPanel.vue'
 
 const store = useRenameStore()
 
-// 初始化时加载保存的脚本
+// 初始化时加载保存的脚本和持久化日志
 onMounted(() => {
   store.initSavedScripts()
+  store.initScriptLogs()
 })
 </script>
 

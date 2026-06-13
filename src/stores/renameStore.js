@@ -74,6 +74,7 @@ export const useRenameStore = defineStore('rename', {
     savedScripts: [], // 保存的脚本模板 [{ id, name, script, created_at, updated_at, display_name, description, parameters }]
     currentScriptId: null, // 当前使用的脚本 ID
     scriptParams: {}, // 脚本参数值 { scriptId: { paramName: value } }
+    scriptLogs: [], // 脚本 console.log 输出（含持久化日志）
   }),
 
   getters: {
@@ -87,6 +88,20 @@ export const useRenameStore = defineStore('rename', {
     // 初始化：加载保存的脚本
     async initSavedScripts() {
       this.savedScripts = await loadSavedScripts()
+    },
+
+    async loadScriptLogs(date = null) {
+      try {
+        const invoke = await getInvoke()
+        this.scriptLogs = await invoke('load_script_logs', { date })
+      } catch (error) {
+        console.error('Failed to load script logs:', error)
+        this.scriptLogs = []
+      }
+    },
+
+    async initScriptLogs() {
+      await this.loadScriptLogs()
     },
     // 选择文件
     async selectFiles() {
@@ -142,6 +157,72 @@ export const useRenameStore = defineStore('rename', {
         }
       } catch (error) {
         this.error = `选择文件夹失败: ${error}`
+        console.error(error)
+      }
+    },
+
+    // 处理拖放的路径（文件或文件夹）
+    async addDroppedPaths(paths) {
+      if (!paths || paths.length === 0) return
+
+      this.error = null
+      this.previewResults = []
+      this.hasPreviewed = false
+
+      try {
+        const { stat } = await import('@tauri-apps/plugin-fs')
+        const dirs = []
+        const files = []
+
+        for (const p of paths) {
+          const meta = await stat(p)
+          if (meta.isDirectory) {
+            dirs.push(p)
+          } else {
+            files.push(p)
+          }
+        }
+
+        if (dirs.length > 0 && files.length > 0) {
+          this.error = '请分别拖放文件或文件夹，不要混合拖放'
+          return
+        }
+
+        if (dirs.length > 1) {
+          this.error = '一次只能拖放一个文件夹'
+          return
+        }
+
+        if (dirs.length === 1) {
+          const selected = dirs[0]
+          this.basePath = selected
+          const folderName = selected.split(/[/\\]/).pop() || selected
+          this.files = [{
+            name: folderName,
+            path: folderName,
+            size: 0,
+            modified: new Date().toISOString(),
+          }]
+          return
+        }
+
+        const fileList = files.map((path) => ({
+          name: path.split(/[/\\]/).pop(),
+          path,
+          size: 0,
+          modified: new Date().toISOString(),
+        }))
+
+        if (this.basePath) {
+          this.basePath = null
+          this.files = fileList
+        } else if (this.hasFiles) {
+          this.files = [...this.files, ...fileList]
+        } else {
+          this.files = fileList
+        }
+      } catch (error) {
+        this.error = `拖放失败: ${error}`
         console.error(error)
       }
     },
@@ -204,9 +285,8 @@ export const useRenameStore = defineStore('rename', {
           error: null,
         }))
 
-        // 保存日志
-        this.scriptLogs = result.logs || []
-        console.log('[DEBUG] Frontend: Received logs:', this.scriptLogs.length, this.scriptLogs)
+        // 从持久化日志文件重新加载（含时间戳）
+        await this.loadScriptLogs()
 
         // 标记已执行过预览
         this.hasPreviewed = true
@@ -309,6 +389,8 @@ export const useRenameStore = defineStore('rename', {
         } else {
           this.error = null
         }
+
+        await this.loadScriptLogs()
 
         // 清空预览
         this.previewResults = []

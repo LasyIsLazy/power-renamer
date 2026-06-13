@@ -26,6 +26,8 @@ fn main() {
             rename_script,
             open_script_file,
             get_scripts_dir_display,
+            load_script_logs,
+            get_logs_dir_display,
             save_script_manifest,
             get_script_manifest,
             open_script_manifest
