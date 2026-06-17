@@ -19,6 +19,10 @@
     "fs:allow-exists",
     "fs:allow-stat",
     "fs:read-all",
-    "fs:write-all"
+    "fs:write-all",
+    "core:webview:allow-create-webview-window",
+    "core:webview:allow-create-webview",
+    "core:event:allow-emit",
+    "core:event:allow-listen"
   ]
 }

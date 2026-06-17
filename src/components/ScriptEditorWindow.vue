@@ -43,6 +43,7 @@
 import { ref, onMounted } from 'vue'
 import { useRenameStore } from '../stores/renameStore'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { emit, listen } from '@tauri-apps/api/event'
 
 const store = useRenameStore()
 const editorRef = ref(null)
@@ -52,31 +53,39 @@ const scriptId = ref(null)
 const scriptNameEditable = ref(true)
 
 onMounted(async () => {
-  // 确保脚本列表已加载
   if (store.savedScripts.length === 0) {
     await store.initSavedScripts()
   }
-  
-  // 从 URL 参数获取脚本 ID
+
   const urlParams = new URLSearchParams(window.location.search)
   const id = urlParams.get('id')
-  
+
   if (id) {
-    scriptId.value = id
-    const script = store.savedScripts.find(s => s.id === id)
-    if (script) {
-      localScript.value = script.script
-      scriptName.value = script.name
-      scriptNameEditable.value = false
-    }
+    await loadScriptById(id)
   } else {
     localScript.value = store.script
   }
+
+  await listen('load-script', async (event) => {
+    if (event.payload?.scriptId) {
+      await loadScriptById(event.payload.scriptId)
+    }
+  })
 })
 
+async function loadScriptById(id) {
+  scriptId.value = id
+  await store.initSavedScripts()
+  const script = store.savedScripts.find((s) => s.id === id)
+  if (script) {
+    localScript.value = script.script
+    scriptName.value = script.name
+    scriptNameEditable.value = false
+  }
+}
+
 const handleInput = () => {
-  // 实时更新 store 中的脚本
-  store.updateScript(localScript.value)
+  // 编辑器窗口独立状态，不污染主窗口 store
 }
 
 const loadTemplate = () => {
@@ -126,7 +135,6 @@ const loadTemplate = () => {
 
   const randomTemplate = templates[Math.floor(Math.random() * templates.length)]
   localScript.value = randomTemplate
-  store.updateScript(randomTemplate)
 }
 
 const formatCode = () => {
@@ -139,7 +147,6 @@ const formatCode = () => {
       .replace(/\n{3,}/g, '\n\n')
     
     localScript.value = formatted
-    store.updateScript(formatted)
   } catch (error) {
     console.error('Format error:', error)
   }
@@ -158,9 +165,10 @@ const saveScript = async () => {
 
   const success = await store.saveScript(scriptName.value.trim(), localScript.value, scriptId.value)
   if (success) {
-    alert('保存成功')
+    const savedId = scriptId.value || scriptName.value.trim().replace(/[<>:"/\\|?*]/g, '_')
+    await emit('script-saved', { scriptId: savedId })
+    await emit('scripts-changed')
     if (!scriptId.value) {
-      // 新建脚本后关闭窗口
       closeWindow()
     }
   }

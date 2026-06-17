@@ -16,6 +16,7 @@
           :expanded-keys="expandedKeys"
           :get-path-parts="getPathParts"
           :has-changed="hasChanged"
+          :is-conflict="isConflict"
           @toggle="$emit('toggle', $event)"
         />
       </template>
@@ -23,7 +24,7 @@
 
     <!-- 文件节点：原路径 → 新路径（带高亮） -->
     <template v-else>
-      <div class="tree-file-row" :class="{ error: node.result && node.result.error }">
+      <div class="tree-file-row" :class="{ error: node.result && node.result.error, conflict: node.result && isConflict(node.result) }">
         <span class="tree-icon tree-icon-file">📄</span>
         <div class="tree-file-content">
           <div class="tree-path-row">
@@ -39,6 +40,7 @@
               </template>
             </span>
           </div>
+          <div v-if="node.result && isConflict(node.result)" class="conflict-tag">路径冲突</div>
           <div v-if="node.result.error" class="error-message">{{ node.result.error }}</div>
         </div>
       </div>
@@ -56,6 +58,7 @@ const props = defineProps({
   expandedKeys: { type: Set, default: () => new Set() },
   getPathParts: { type: Function, required: true },
   hasChanged: { type: Function, required: true },
+  isConflict: { type: Function, default: () => false },
 })
 
 defineEmits(['toggle'])
@@ -163,9 +166,15 @@ const expanded = computed(() => props.expandedKeys.has(props.node.key))
   flex-shrink: 0;
 }
 
-.error-message {
+.tree-file-row.conflict {
+  background: #fff5f5;
+  border-left: 3px solid #dc3545;
+}
+
+.conflict-tag {
   font-size: 11px;
   color: #dc3545;
+  font-weight: 600;
   padding-left: 22px;
 }
 </style>

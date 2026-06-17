@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::{Manager, State};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RenameResult {
     pub original: String,
     pub new_name: String,
@@ -570,6 +570,82 @@ pub async fn get_folder_files(folder_path: String) -> Result<Vec<String>, String
 
     files.sort();
     Ok(files)
+}
+
+fn count_files_recursive(path: &Path) -> Result<usize, String> {
+    if !path.exists() {
+        return Err("文件夹不存在".to_string());
+    }
+    if !path.is_dir() {
+        return Err("路径不是文件夹".to_string());
+    }
+    if !path.is_absolute() {
+        return Err("路径必须是绝对路径".to_string());
+    }
+
+    let mut count = 0usize;
+    let entries = std::fs::read_dir(path).map_err(|e| format!("读取文件夹失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let entry_path = entry.path();
+        if entry_path.is_file() {
+            count += 1;
+        } else if entry_path.is_dir() {
+            count += count_files_recursive(&entry_path)?;
+        }
+    }
+    Ok(count)
+}
+
+/// 递归统计文件夹内文件数量
+#[tauri::command]
+pub async fn count_folder_files_recursive(folder_path: String) -> Result<usize, String> {
+    count_files_recursive(Path::new(&folder_path))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HistoryEntry {
+    pub timestamp: String,
+    pub files: Vec<serde_json::Value>,
+    pub script: String,
+    pub results: Vec<RenameResult>,
+}
+
+fn get_history_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+    Ok(app_data_dir.join("history.json"))
+}
+
+/// 保存历史记录（最多保留 50 条）
+#[tauri::command]
+pub async fn save_history(
+    app: tauri::AppHandle,
+    history: Vec<HistoryEntry>,
+) -> Result<(), String> {
+    let history_file = get_history_file(&app)?;
+    let trimmed: Vec<HistoryEntry> = history.into_iter().take(50).collect();
+    let json = serde_json::to_string_pretty(&trimmed)
+        .map_err(|e| format!("Failed to serialize history: {}", e))?;
+    fs::write(&history_file, json)
+        .map_err(|e| format!("Failed to write history file: {}", e))?;
+    Ok(())
+}
+
+/// 加载历史记录
+#[tauri::command]
+pub async fn load_history(app: tauri::AppHandle) -> Result<Vec<HistoryEntry>, String> {
+    let history_file = get_history_file(&app)?;
+    if !history_file.exists() {
+        return Ok(vec![]);
+    }
+    let content = fs::read_to_string(&history_file)
+        .map_err(|e| format!("Failed to read history file: {}", e))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse history: {}", e))
 }
 
 /// 获取文件夹内所有子文件夹
