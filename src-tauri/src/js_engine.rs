@@ -4,6 +4,33 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::js_utils::{Md5Options, Md5PreviewMode};
+use crate::preview_session::PreviewSession;
+
+/// 脚本执行选项
+#[derive(Clone, Default)]
+pub struct ExecuteOptions {
+    /// 是否为预览模式（预览模式下可能跳过耗时的 MD5 计算）
+    pub preview_mode: bool,
+    /// 待处理文件总数（用于判断是否跳过 MD5）
+    pub total_file_count: usize,
+    /// 预览时 MD5 计算策略
+    pub preview_md5_mode: Md5PreviewMode,
+    /// 预览会话（用于进度与取消）
+    pub session: Option<PreviewSession>,
+}
+
+impl ExecuteOptions {
+    pub fn md5_options(&self) -> Md5Options {
+        Md5Options {
+            preview_mode: self.preview_mode,
+            total_file_count: self.total_file_count,
+            preview_md5_mode: self.preview_md5_mode,
+            session: self.session.clone(),
+        }
+    }
+}
+
 /// 重命名结果：可以是单个文件的新名称，或批量重命名映射
 #[derive(Debug, Clone)]
 pub enum RenameResult {
@@ -16,6 +43,15 @@ pub enum RenameResult {
 pub struct JsEngine {
     runtime: Arc<Mutex<JsRuntime>>,
     log_collector: crate::js_utils::LogCollector,
+}
+
+impl Clone for JsEngine {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: Arc::clone(&self.runtime),
+            log_collector: self.log_collector.clone(),
+        }
+    }
 }
 
 unsafe impl Send for JsEngine {}
@@ -35,7 +71,14 @@ impl JsEngine {
     /// filename: 文件或文件夹名称
     /// params: 脚本参数
     /// 返回：单个文件的新名称，或批量重命名映射
-    pub fn execute_rename(&self, filename: &str, script: &str, file_path: Option<&str>, params: Option<&HashMap<String, JsonValue>>) -> Result<RenameResult> {
+    pub fn execute_rename(
+        &self,
+        filename: &str,
+        script: &str,
+        file_path: Option<&str>,
+        params: Option<&HashMap<String, JsonValue>>,
+        options: ExecuteOptions,
+    ) -> Result<RenameResult> {
         if script.trim().is_empty() {
             anyhow::bail!("Script is empty");
         }
@@ -51,7 +94,7 @@ impl JsEngine {
         let result = context.with(|ctx| {
             // 1. 首先注入 JS 工具函数到 __utils 对象（path、md5、fs、log）
             // 这些工具函数需要在编译脚本之前就注入，这样脚本编译时就能访问到
-            crate::js_utils::setup_js_utils(&ctx, Some(&self.log_collector))
+            crate::js_utils::setup_js_utils(&ctx, Some(&self.log_collector), options.md5_options())
                 .with_context(|| {
                     format!(
                         "Failed to setup JS utils. This may be due to:\n\
@@ -226,6 +269,7 @@ impl JsEngine {
         file_path: &str,
         script: &str,
         params: Option<&HashMap<String, JsonValue>>,
+        options: ExecuteOptions,
     ) -> Result<Vec<(String, String)>> {
         let path = std::path::Path::new(file_path);
         let filename = path.file_name()
@@ -233,7 +277,7 @@ impl JsEngine {
             .map(|s| s.to_string())
             .unwrap_or_else(|| file_path.to_string());
         
-        match self.execute_rename(&filename, script, Some(file_path), params) {
+        match self.execute_rename(&filename, script, Some(file_path), params, options) {
             Ok(RenameResult::Single(new_name)) => {
                 // 检查是否是错误消息
                 if new_name.starts_with("ERROR:") {

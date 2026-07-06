@@ -46,6 +46,7 @@ const onCancel = () => emit('cancel')
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
   z-index: 2000;
 }
 
@@ -53,7 +54,10 @@ const onCancel = () => emit('cancel')
   background: white;
   border-radius: 8px;
   width: 90%;
-  max-width: 480px;
+  max-width: 520px;
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
   overflow: hidden;
 }
@@ -61,6 +65,7 @@ const onCancel = () => emit('cancel')
 .dialog-header {
   padding: 16px 20px;
   border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
 }
 
 .dialog-header h4 {
@@ -74,11 +79,15 @@ const onCancel = () => emit('cancel')
   color: #333;
   font-size: 14px;
   line-height: 1.5;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1 1 auto;
 }
 
 .dialog-body p {
   margin: 0;
   white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .dialog-footer {
@@ -87,6 +96,7 @@ const onCancel = () => emit('cancel')
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .btn {

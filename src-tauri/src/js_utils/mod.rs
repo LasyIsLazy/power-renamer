@@ -3,8 +3,10 @@ use rquickjs::{Ctx, Function, Object};
 use std::sync::{Arc, Mutex};
 
 mod path;
-mod md5;
+pub mod md5;
 mod fs;
+
+pub use md5::{Md5Options, Md5PreviewMode};
 
 /// 日志收集器：用于收集 console.log 的输出
 #[derive(Clone)]
@@ -46,7 +48,11 @@ impl LogCollector {
 
 /// 设置 JS 工具函数，将所有工具函数统一放到 __utils 全局对象中
 /// 包括 path、md5、fs、log 等工具函数
-pub fn setup_js_utils<'js>(ctx: &Ctx<'js>, log_collector: Option<&LogCollector>) -> Result<()> {
+pub fn setup_js_utils<'js>(
+    ctx: &Ctx<'js>,
+    log_collector: Option<&LogCollector>,
+    md5_options: Md5Options,
+) -> Result<()> {
     let global = ctx.globals();
 
     // 创建 __utils 对象
@@ -106,11 +112,8 @@ pub fn setup_js_utils<'js>(ctx: &Ctx<'js>, log_collector: Option<&LogCollector>)
     let md5_obj = Object::new(ctx.clone())?;
     
     // 绑定 md5.file
-    let file_md5_fn = Function::new(ctx.clone(), |file_path: String| -> String {
-        md5::file_md5(file_path).unwrap_or_else(|e| {
-            // 如果出错，返回错误信息（或者可以抛出 JS 异常）
-            format!("ERROR: {}", e)
-        })
+    let file_md5_fn = Function::new(ctx.clone(), move |file_path: String| -> String {
+        md5::file_md5_with_options(file_path, &md5_options)
     })?;
     md5_obj.set("file", file_md5_fn)?;
     

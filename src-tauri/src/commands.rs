@@ -1,4 +1,6 @@
-use crate::js_engine::JsEngine;
+use crate::js_engine::{ExecuteOptions, JsEngine};
+use crate::js_utils::Md5PreviewMode;
+use crate::preview_session::{OperationKind, PreviewCompletePayload, PreviewSession};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -14,11 +16,12 @@ pub struct RenameResult {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PreviewResult {
-    pub mappings: Vec<(String, String)>,
-    pub errors: Vec<String>,
-    pub logs: Vec<String>, // 脚本执行时的 console.log 输出
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteCompletePayload {
+    pub results: Vec<RenameResult>,
+    pub cancelled: bool,
+    pub error: Option<String>,
 }
 
 fn get_logs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -107,7 +110,174 @@ pub async fn get_logs_dir_display(app: tauri::AppHandle) -> Result<String, Strin
     Ok(logs_dir.to_string_lossy().to_string())
 }
 
-/// 预览重命名结果（不实际重命名）
+fn count_preview_files(paths: &[String]) -> Result<usize, String> {
+    let mut count = 0usize;
+    for p in paths {
+        let path = Path::new(p);
+        if path.is_dir() {
+            count += count_files_recursive(path)?;
+        } else if path.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// 预览模式下是否会跳过 MD5 计算
+fn will_skip_md5_in_preview(total_file_count: usize, mode: Md5PreviewMode) -> bool {
+    match mode {
+        Md5PreviewMode::Always => false,
+        Md5PreviewMode::Skip => true,
+        Md5PreviewMode::Auto => {
+            total_file_count > crate::js_utils::md5::PREVIEW_FILE_COUNT_THRESHOLD
+        }
+    }
+}
+
+fn build_preview_new_path(original_path: &str, new_name: &str) -> String {
+    if PathBuf::from(new_name).is_absolute() {
+        new_name.to_string()
+    } else {
+        let original_path_buf = PathBuf::from(original_path);
+        if let Some(parent) = original_path_buf.parent() {
+            parent.join(new_name).to_string_lossy().to_string()
+        } else {
+            new_name.to_string()
+        }
+    }
+}
+
+/// 将脚本返回的映射转为预览结果，返回 (有效映射, 错误列表, 是否出错)
+fn normalize_preview_mappings(
+    mappings: Vec<(String, String)>,
+) -> (Vec<(String, String)>, Vec<String>, bool) {
+    let mut result_mappings = Vec::new();
+    let mut errors = Vec::new();
+    let mut has_error = false;
+
+    for (original_path, new_name) in mappings {
+        if new_name.starts_with("ERROR:") {
+            errors.push(format!("{}: {}", original_path, new_name));
+            has_error = true;
+            break;
+        }
+
+        let new_path = build_preview_new_path(&original_path, &new_name);
+        let original_path_buf = PathBuf::from(&original_path);
+        let new_path_buf = PathBuf::from(&new_path);
+
+        if original_path_buf != new_path_buf {
+            result_mappings.push((original_path, new_path));
+        }
+    }
+
+    (result_mappings, errors, has_error)
+}
+
+/// 取消正在进行的预览
+#[tauri::command]
+pub async fn cancel_preview(session: State<'_, PreviewSession>) -> Result<(), String> {
+    session.cancel();
+    Ok(())
+}
+
+/// 在后台线程执行预览，避免阻塞 IPC 导致进度事件无法及时送达前端
+fn run_preview_work(
+    app: tauri::AppHandle,
+    engine: JsEngine,
+    session: PreviewSession,
+    full_paths: Vec<String>,
+    script: String,
+    params: Option<HashMap<String, serde_json::Value>>,
+    total_file_count: usize,
+    md5_mode: Md5PreviewMode,
+) {
+    let mut md5_preview_placeholder = will_skip_md5_in_preview(total_file_count, md5_mode);
+    let execute_options = ExecuteOptions {
+        preview_mode: true,
+        total_file_count,
+        preview_md5_mode: md5_mode,
+        session: Some(session.clone()),
+    };
+
+    session.emit_progress(0, total_file_count, None, "start");
+
+    let mut all_mappings = Vec::new();
+    let mut errors = Vec::new();
+    let mut all_logs = Vec::new();
+    let mut cancelled = false;
+
+    for file_path in &full_paths {
+        if session.is_cancelled() {
+            cancelled = true;
+            eprintln!("[preview] cancelled before processing {}", file_path);
+            break;
+        }
+
+        session.emit_progress(
+            session.files_done(),
+            total_file_count,
+            Some(file_path.clone()),
+            "script",
+        );
+
+        eprintln!("[preview] executing script for {}", file_path);
+
+        match engine.execute_rename_single(file_path, &script, params.as_ref(), execute_options.clone())
+        {
+            Ok(mappings) => {
+                let logs = engine.get_logs();
+                let (chunk_mappings, chunk_errors, has_error) = normalize_preview_mappings(mappings);
+
+                if !logs.is_empty() {
+                    all_logs.extend(logs.clone());
+                }
+
+                if !chunk_mappings.is_empty() {
+                    all_mappings.extend(chunk_mappings.clone());
+                    session.emit_chunk(chunk_mappings, logs);
+                }
+
+                if has_error {
+                    errors.extend(chunk_errors);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("[preview] script error for {}: {}", file_path, e);
+                if session.is_cancelled() {
+                    cancelled = true;
+                } else {
+                    errors.push(format!("{}: {}", file_path, e));
+                }
+                break;
+            }
+        }
+    }
+
+    if session.is_cancelled() {
+        cancelled = true;
+    }
+
+    if let Err(e) = persist_script_logs(&app, "preview", &all_logs) {
+        eprintln!("[preview] failed to persist script logs: {}", e);
+    }
+
+    if !md5_preview_placeholder {
+        md5_preview_placeholder = all_mappings.iter().any(|(_, new_name)| {
+            new_name.contains(crate::js_utils::md5::PREVIEW_PLACEHOLDER)
+        });
+    }
+
+    session.emit_preview_complete(PreviewCompletePayload {
+        md5_preview_placeholder,
+        errors,
+        cancelled,
+    });
+    session.finish();
+}
+
+/// 预览重命名结果（通过事件增量推送，不实际重命名）
 #[tauri::command]
 pub async fn preview_rename(
     app: tauri::AppHandle,
@@ -115,22 +285,32 @@ pub async fn preview_rename(
     script: String,
     base_path: Option<String>,
     params: Option<HashMap<String, serde_json::Value>>,
+    preview_md5_mode: Option<String>,
     engine: State<'_, JsEngine>,
-) -> Result<PreviewResult, String> {
+    session: State<'_, PreviewSession>,
+) -> Result<(), String> {
     if files.is_empty() {
-        return Ok(PreviewResult {
-            mappings: vec![],
-            errors: vec!["文件列表为空".to_string()],
-            logs: vec![],
-        });
+        PreviewSession::emit_preview_complete_via_app(
+            &app,
+            PreviewCompletePayload {
+                md5_preview_placeholder: false,
+                errors: vec!["文件列表为空".to_string()],
+                cancelled: false,
+            },
+        );
+        return Ok(());
     }
 
     if script.trim().is_empty() {
-        return Ok(PreviewResult {
-            mappings: vec![],
-            errors: vec!["脚本不能为空".to_string()],
-            logs: vec![],
-        });
+        PreviewSession::emit_preview_complete_via_app(
+            &app,
+            PreviewCompletePayload {
+                md5_preview_placeholder: false,
+                errors: vec!["脚本不能为空".to_string()],
+                cancelled: false,
+            },
+        );
+        return Ok(());
     }
 
     // 构建完整路径列表（如果有 base_path，需要拼接）
@@ -156,80 +336,361 @@ pub async fn preview_rename(
     for p in &full_paths {
         let path_buf = PathBuf::from(p);
         if !path_buf.exists() {
-            return Ok(PreviewResult {
-                mappings: vec![],
-                errors: vec![format!("路径不存在: {}", p)],
-                logs: vec![],
-            });
+            PreviewSession::emit_preview_complete_via_app(
+                &app,
+                PreviewCompletePayload {
+                    md5_preview_placeholder: false,
+                    errors: vec![format!("路径不存在: {}", p)],
+                    cancelled: false,
+                },
+            );
+            return Ok(());
         }
     }
 
-    // 对每个选择的文件/文件夹调用一次 rename
+    let total_file_count = count_preview_files(&full_paths)?;
+    session.try_begin(app.clone(), total_file_count, OperationKind::Preview)?;
+
+    let md5_mode = Md5PreviewMode::from_str(preview_md5_mode.as_deref().unwrap_or("auto"));
+    let preview_session = (*session).clone();
+    let engine = (*engine).clone();
+    let script_clone = script.clone();
+    let params_clone = params.clone();
+    let full_paths_clone = full_paths.clone();
+    let app_clone = app.clone();
+
+    eprintln!(
+        "[preview] spawning worker thread, paths={}, total_files={}",
+        full_paths_clone.len(),
+        total_file_count
+    );
+
+    std::thread::spawn(move || {
+        run_preview_work(
+            app_clone,
+            engine,
+            preview_session,
+            full_paths_clone,
+            script_clone,
+            params_clone,
+            total_file_count,
+            md5_mode,
+        );
+    });
+
+    Ok(())
+}
+
+/// 执行重命名核心逻辑
+fn run_execute_core(
+    app: &tauri::AppHandle,
+    engine: &JsEngine,
+    session: Option<&PreviewSession>,
+    full_paths: &[String],
+    script: &str,
+    params: Option<&HashMap<String, serde_json::Value>>,
+    base_path: &Option<String>,
+) -> Result<Vec<RenameResult>, String> {
+    let total_file_count = count_preview_files(full_paths)?;
+    if let Some(s) = session {
+        s.emit_progress(0, total_file_count, None, "start");
+    }
+
+    let execute_options = ExecuteOptions {
+        preview_mode: false,
+        total_file_count,
+        preview_md5_mode: Md5PreviewMode::Always,
+        session: session.cloned(),
+    };
+
     let mut all_mappings = Vec::new();
-    let mut errors = Vec::new();
     let mut all_logs = Vec::new();
 
-    for file_path in &full_paths {
-        match engine.execute_rename_single(file_path, &script, params.as_ref()) {
+    for file_path in full_paths {
+        if session.is_some_and(|s| s.is_cancelled()) {
+            break;
+        }
+
+        if let Some(s) = session {
+            s.emit_progress(
+                s.files_done(),
+                total_file_count,
+                Some(file_path.clone()),
+                "script",
+            );
+        }
+
+        match engine.execute_rename_single(file_path, script, params, execute_options.clone()) {
             Ok(mappings) => {
-                // 收集日志
                 let logs = engine.get_logs();
                 all_logs.extend(logs);
-
-                let mut has_error = false;
-                for (original_path, new_name) in mappings {
-                    if new_name.starts_with("ERROR:") {
-                        errors.push(format!("{}: {}", original_path, new_name));
-                        has_error = true;
-                        break; // 单个文件内部错误，不再处理该文件的其余映射
-                    } else {
-                        // 统一格式：如果 original_path 是完整路径，new_name 也应该是完整路径
-                        // 如果 new_name 是相对路径或只是文件名，需要转换为完整路径
-                        let new_path = if PathBuf::from(&new_name).is_absolute() {
-                            // 已经是完整路径，直接使用
-                            new_name
-                        } else {
-                            // 如果是相对路径或文件名，需要从 original_path 的目录构建完整路径
-                            let original_path_buf = PathBuf::from(&original_path);
-                            if let Some(parent) = original_path_buf.parent() {
-                                parent.join(&new_name).to_string_lossy().to_string()
-                            } else {
-                                // 如果没有父目录，直接使用 new_name（可能是完整路径字符串）
-                                new_name
-                            }
-                        };
-                        
-                        // 比较路径，如果原文件名和新文件名相同，则跳过（不显示在预览中）
-                        // 使用 PathBuf 来规范化路径分隔符，然后比较
-                        let original_path_buf = PathBuf::from(&original_path);
-                        let new_path_buf = PathBuf::from(&new_path);
-                        
-                        // 如果路径相同（PathBuf 的比较会处理路径分隔符的规范化），跳过
-                        if original_path_buf != new_path_buf {
-                            all_mappings.push((original_path, new_path));
-                        }
-                    }
-                }
+                let has_error = mappings.iter().any(|(_, new_name)| new_name.starts_with("ERROR:"));
+                all_mappings.extend(mappings);
                 if has_error {
-                    break; // 出错时终止后续文件处理
+                    break;
                 }
             }
             Err(e) => {
-                errors.push(format!("{}: {}", file_path, e));
-                break; // 出错时终止后续文件处理
+                all_mappings.push((file_path.clone(), format!("ERROR: {}", e)));
+                break;
             }
         }
     }
 
-    if let Err(e) = persist_script_logs(&app, "preview", &all_logs) {
-        eprintln!("Failed to persist script logs: {}", e);
+    if let Err(e) = persist_script_logs(app, "execute", &all_logs) {
+        eprintln!("[execute] failed to persist script logs: {}", e);
     }
 
-    Ok(PreviewResult {
-        mappings: all_mappings,
-        errors,
-        logs: all_logs,
-    })
+    let rename_total = all_mappings.len();
+    if let Some(s) = session {
+        s.emit_progress(0, rename_total.max(1), None, "rename");
+    }
+
+    let mut results = Vec::new();
+    let mut renamed_folders: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
+
+    for (rename_index, (original, new_name)) in all_mappings.into_iter().enumerate() {
+        if session.is_some_and(|s| s.is_cancelled()) {
+            break;
+        }
+
+        if let Some(s) = session {
+            s.emit_progress(
+                rename_index,
+                rename_total.max(1),
+                Some(original.clone()),
+                "rename",
+            );
+        }
+
+        if new_name.starts_with("ERROR:") {
+            results.push(RenameResult {
+                original: original.clone(),
+                new_name: new_name.clone(),
+                success: false,
+                error: Some(new_name.clone()),
+            });
+            continue;
+        }
+
+        let original_path_buf = PathBuf::from(&original);
+        let old_path = if original_path_buf.is_absolute() {
+            if let Some(base) = base_path {
+                let base = PathBuf::from(base);
+                if !original_path_buf.starts_with(&base) {
+                    results.push(RenameResult {
+                        original: original.clone(),
+                        new_name: new_name.clone(),
+                        success: false,
+                        error: Some("路径遍历攻击检测".to_string()),
+                    });
+                    continue;
+                }
+            }
+            original_path_buf
+        } else if let Some(base) = base_path {
+            let base = PathBuf::from(base);
+            let joined = base.join(&original);
+            if !joined.starts_with(&base) {
+                results.push(RenameResult {
+                    original: original.clone(),
+                    new_name: new_name.clone(),
+                    success: false,
+                    error: Some("路径遍历攻击检测".to_string()),
+                });
+                continue;
+            }
+            joined
+        } else {
+            original_path_buf
+        };
+
+        let new_path_buf = PathBuf::from(&new_name);
+        let new_path = if new_path_buf.is_absolute() {
+            if let Some(base) = base_path {
+                let base = PathBuf::from(base);
+                if !new_path_buf.starts_with(&base) {
+                    results.push(RenameResult {
+                        original: original.clone(),
+                        new_name: new_name.clone(),
+                        success: false,
+                        error: Some("路径遍历攻击检测".to_string()),
+                    });
+                    continue;
+                }
+            }
+            new_path_buf
+        } else if let Some(base) = base_path {
+            let base = PathBuf::from(base);
+            let joined = base.join(&new_name);
+            if !joined.starts_with(&base) {
+                results.push(RenameResult {
+                    original: original.clone(),
+                    new_name: new_name.clone(),
+                    success: false,
+                    error: Some("路径遍历攻击检测".to_string()),
+                });
+                continue;
+            }
+            joined
+        } else if let Some(parent) = old_path.parent() {
+            parent.join(&new_name)
+        } else {
+            PathBuf::from(&new_name)
+        };
+
+        if let Some(file_name) = new_path.file_name() {
+            if let Some(file_name_str) = file_name.to_str() {
+                if !is_valid_filename(file_name_str) {
+                    results.push(RenameResult {
+                        original: original.clone(),
+                        new_name: new_name.clone(),
+                        success: false,
+                        error: Some("文件名包含非法字符".to_string()),
+                    });
+                    continue;
+                }
+            } else {
+                results.push(RenameResult {
+                    original: original.clone(),
+                    new_name: new_name.clone(),
+                    success: false,
+                    error: Some("文件名包含非法字符（无法转换为字符串）".to_string()),
+                });
+                continue;
+            }
+        } else {
+            results.push(RenameResult {
+                original: original.clone(),
+                new_name: new_name.clone(),
+                success: false,
+                error: Some("无效的文件路径".to_string()),
+            });
+            continue;
+        }
+
+        if old_path == new_path {
+            continue;
+        }
+
+        let mut actual_old_path = old_path.clone();
+        if !actual_old_path.exists() {
+            if let Some(parent) = actual_old_path.parent() {
+                if let Some(new_parent) = renamed_folders.get(parent) {
+                    if let Some(file_name) = actual_old_path.file_name() {
+                        actual_old_path = new_parent.join(file_name);
+                    }
+                } else {
+                    let mut current_parent = parent;
+                    let mut updated_path = actual_old_path.clone();
+                    while let Some(grandparent) = current_parent.parent() {
+                        if let Some(new_grandparent) = renamed_folders.get(grandparent) {
+                            let relative_path = actual_old_path
+                                .strip_prefix(grandparent)
+                                .unwrap_or(&actual_old_path);
+                            updated_path = new_grandparent.join(relative_path);
+                            break;
+                        }
+                        current_parent = grandparent;
+                    }
+                    actual_old_path = updated_path;
+                }
+            }
+        }
+
+        if !actual_old_path.exists() {
+            results.push(RenameResult {
+                original: original.clone(),
+                new_name: new_name.clone(),
+                success: false,
+                error: Some("源文件不存在".to_string()),
+            });
+            continue;
+        }
+
+        if new_path.exists() && actual_old_path != new_path {
+            results.push(RenameResult {
+                original: original.clone(),
+                new_name: new_name.clone(),
+                success: false,
+                error: Some("目标文件已存在".to_string()),
+            });
+            continue;
+        }
+
+        let is_folder = actual_old_path.is_dir();
+
+        match std::fs::rename(&actual_old_path, &new_path) {
+            Ok(_) => {
+                if is_folder {
+                    renamed_folders.insert(old_path.clone(), new_path.clone());
+                }
+                results.push(RenameResult {
+                    original: original.clone(),
+                    new_name: new_name.clone(),
+                    success: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                results.push(RenameResult {
+                    original: original.clone(),
+                    new_name: new_name.clone(),
+                    success: false,
+                    error: Some(format!("重命名失败: {}", e)),
+                });
+            }
+        }
+
+        if let Some(s) = session {
+            s.emit_progress(
+                rename_index + 1,
+                rename_total.max(1),
+                Some(original),
+                "rename",
+            );
+        }
+    }
+
+    Ok(results)
+}
+
+fn run_execute_work(
+    app: tauri::AppHandle,
+    engine: JsEngine,
+    session: PreviewSession,
+    full_paths: Vec<String>,
+    script: String,
+    params: Option<HashMap<String, serde_json::Value>>,
+    base_path: Option<String>,
+) {
+    let cancelled = session.is_cancelled();
+    let outcome = run_execute_core(
+        &app,
+        &engine,
+        Some(&session),
+        &full_paths,
+        &script,
+        params.as_ref(),
+        &base_path,
+    );
+
+    let payload = match outcome {
+        Ok(results) => ExecuteCompletePayload {
+            results,
+            cancelled: session.is_cancelled() || cancelled,
+            error: None,
+        },
+        Err(e) => ExecuteCompletePayload {
+            results: vec![],
+            cancelled: session.is_cancelled(),
+            error: Some(e),
+        },
+    };
+
+    session.emit_execute_complete(payload);
+    session.finish();
 }
 
 /// 执行重命名操作
@@ -240,8 +701,10 @@ pub async fn execute_rename(
     script: String,
     base_path: Option<String>,
     params: Option<HashMap<String, serde_json::Value>>,
+    silent: Option<bool>,
     engine: State<'_, JsEngine>,
-) -> Result<Vec<RenameResult>, String> {
+    session: State<'_, PreviewSession>,
+) -> Result<Option<Vec<RenameResult>>, String> {
     if files.is_empty() {
         return Err("文件列表为空".to_string());
     }
@@ -277,252 +740,50 @@ pub async fn execute_rename(
         }
     }
 
-    // 对每个选择的文件/文件夹调用一次 rename
-    let mut all_mappings = Vec::new();
-    let mut all_logs = Vec::new();
-
-    for file_path in &full_paths {
-        match engine.execute_rename_single(file_path, &script, params.as_ref()) {
-            Ok(mappings) => {
-                let logs = engine.get_logs();
-                all_logs.extend(logs);
-
-                let has_error = mappings.iter().any(|(_, new_name)| new_name.starts_with("ERROR:"));
-                all_mappings.extend(mappings);
-                if has_error {
-                    break; // 出错时终止后续文件处理
-                }
-            }
-            Err(e) => {
-                all_mappings.push((file_path.clone(), format!("ERROR: {}", e)));
-                break; // 出错时终止后续文件处理
-            }
-        }
+    if silent.unwrap_or(false) {
+        let engine = (*engine).clone();
+        let results = run_execute_core(
+            &app,
+            &engine,
+            None,
+            &full_paths,
+            &script,
+            params.as_ref(),
+            &base_path,
+        )?;
+        return Ok(Some(results));
     }
 
-    if let Err(e) = persist_script_logs(&app, "execute", &all_logs) {
-        eprintln!("Failed to persist script logs: {}", e);
-    }
+    let total_file_count = count_preview_files(&full_paths)?;
+    session.try_begin(app.clone(), total_file_count, OperationKind::Execute)?;
 
-    let mut results = Vec::new();
-    
-    // 维护已重命名的文件夹映射表：旧路径 -> 新路径
-    let mut renamed_folders: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+    let engine = (*engine).clone();
+    let preview_session = (*session).clone();
+    let script_clone = script.clone();
+    let params_clone = params.clone();
+    let full_paths_clone = full_paths.clone();
+    let base_path_clone = base_path.clone();
+    let app_clone = app.clone();
 
-    for (original, new_name) in all_mappings {
-        // 跳过错误结果
-        if new_name.starts_with("ERROR:") {
-            results.push(RenameResult {
-                original: original.clone(),
-                new_name: new_name.clone(),
-                success: false,
-                error: Some(new_name.clone()),
-            });
-            continue;
-        }
-        
-        // 构建完整路径（防止路径遍历攻击）
-        // 检查 original 是否是绝对路径
-        let original_path_buf = PathBuf::from(&original);
-        let old_path = if original_path_buf.is_absolute() {
-            // 如果 original 已经是绝对路径，直接使用（脚本返回的完整路径）
-            // 但如果 base_path 存在，需要验证路径在基础目录内
-            if let Some(base) = &base_path {
-                let base = PathBuf::from(base);
-                if !original_path_buf.starts_with(&base) {
-                    results.push(RenameResult {
-                        original: original.clone(),
-                        new_name: new_name.clone(),
-                        success: false,
-                        error: Some("路径遍历攻击检测".to_string()),
-                    });
-                    continue;
-                }
-            }
-            original_path_buf
-        } else if let Some(base) = &base_path {
-            // 如果 original 是相对路径，且 base_path 存在，则拼接
-            let base = PathBuf::from(base);
-            let joined = base.join(&original);
-            // 验证路径在基础目录内
-            if !joined.starts_with(&base) {
-                results.push(RenameResult {
-                    original: original.clone(),
-                    new_name: new_name.clone(),
-                    success: false,
-                    error: Some("路径遍历攻击检测".to_string()),
-                });
-                continue;
-            }
-            joined
-        } else {
-            // 当 base_path 为 None 且 original 是相对路径时，使用 original
-            original_path_buf
-        };
+    eprintln!(
+        "[execute] spawning worker thread, paths={}, total_files={}",
+        full_paths_clone.len(),
+        total_file_count
+    );
 
-        // 检查 new_name 是否是绝对路径
-        let new_path_buf = PathBuf::from(&new_name);
-        let new_path = if new_path_buf.is_absolute() {
-            // 如果 new_name 已经是完整路径，直接使用
-            // 但如果 base_path 存在，需要验证路径在基础目录内
-            if let Some(base) = &base_path {
-                let base = PathBuf::from(base);
-                if !new_path_buf.starts_with(&base) {
-                    results.push(RenameResult {
-                        original: original.clone(),
-                        new_name: new_name.clone(),
-                        success: false,
-                        error: Some("路径遍历攻击检测".to_string()),
-                    });
-                    continue;
-                }
-            }
-            new_path_buf
-        } else if let Some(base) = &base_path {
-            // 如果 new_name 是相对路径，且 base_path 存在，则拼接
-            let base = PathBuf::from(base);
-            let joined = base.join(&new_name);
-            // 验证路径在基础目录内
-            if !joined.starts_with(&base) {
-                results.push(RenameResult {
-                    original: original.clone(),
-                    new_name: new_name.clone(),
-                    success: false,
-                    error: Some("路径遍历攻击检测".to_string()),
-                });
-                continue;
-            }
-            joined
-        } else {
-            // 如果只是文件名，从原始路径提取目录，然后与新文件名组合
-            if let Some(parent) = old_path.parent() {
-                parent.join(&new_name)
-            } else {
-                // 如果没有父目录，直接使用新文件名
-                PathBuf::from(&new_name)
-            }
-        };
+    std::thread::spawn(move || {
+        run_execute_work(
+            app_clone,
+            engine,
+            preview_session,
+            full_paths_clone,
+            script_clone,
+            params_clone,
+            base_path_clone,
+        );
+    });
 
-        // 验证新文件名（只验证文件名部分，不验证完整路径）
-        if let Some(file_name) = new_path.file_name() {
-            if let Some(file_name_str) = file_name.to_str() {
-                if !is_valid_filename(file_name_str) {
-                    results.push(RenameResult {
-                        original: original.clone(),
-                        new_name: new_name.clone(),
-                        success: false,
-                        error: Some("文件名包含非法字符".to_string()),
-                    });
-                    continue;
-                }
-            } else {
-                results.push(RenameResult {
-                    original: original.clone(),
-                    new_name: new_name.clone(),
-                    success: false,
-                    error: Some("文件名包含非法字符（无法转换为字符串）".to_string()),
-                });
-                continue;
-            }
-        } else {
-            results.push(RenameResult {
-                original: original.clone(),
-                new_name: new_name.clone(),
-                success: false,
-                error: Some("无效的文件路径".to_string()),
-            });
-            continue;
-        }
-
-        // 比较路径，如果原文件名和新文件名相同，则跳过（不进行重命名）
-        // PathBuf 的比较会处理路径分隔符的规范化
-        if old_path == new_path {
-            continue;
-        }
-        
-        // 如果 old_path 不存在，检查是否有父文件夹被重命名
-        let mut actual_old_path = old_path.clone();
-        if !actual_old_path.exists() {
-            // 尝试查找父文件夹是否已被重命名
-            if let Some(parent) = actual_old_path.parent() {
-                // 检查父文件夹是否在已重命名的映射表中
-                if let Some(new_parent) = renamed_folders.get(parent) {
-                    // 获取文件名
-                    if let Some(file_name) = actual_old_path.file_name() {
-                        // 更新 old_path 为新父文件夹下的文件
-                        actual_old_path = new_parent.join(file_name);
-                    }
-                } else {
-                    // 递归检查更上层的父文件夹
-                    let mut current_parent = parent;
-                    let mut updated_path = actual_old_path.clone();
-                    while let Some(grandparent) = current_parent.parent() {
-                        if let Some(new_grandparent) = renamed_folders.get(grandparent) {
-                            // 找到被重命名的父文件夹，构建新路径
-                            let relative_path = actual_old_path.strip_prefix(grandparent)
-                                .unwrap_or(&actual_old_path);
-                            updated_path = new_grandparent.join(relative_path);
-                            break;
-                        }
-                        current_parent = grandparent;
-                    }
-                    actual_old_path = updated_path;
-                }
-            }
-        }
-        
-        // 检查文件是否存在（使用更新后的路径）
-        if !actual_old_path.exists() {
-            results.push(RenameResult {
-                original: original.clone(),
-                new_name: new_name.clone(),
-                success: false,
-                error: Some("源文件不存在".to_string()),
-            });
-            continue;
-        }
-
-        // 检查目标文件是否已存在
-        if new_path.exists() && actual_old_path != new_path {
-            results.push(RenameResult {
-                original: original.clone(),
-                new_name: new_name.clone(),
-                success: false,
-                error: Some("目标文件已存在".to_string()),
-            });
-            continue;
-        }
-        
-        // 检查 actual_old_path 是否是文件夹（在执行重命名前检查）
-        let is_folder = actual_old_path.is_dir();
-        
-        // 执行重命名（使用更新后的路径）
-        match std::fs::rename(&actual_old_path, &new_path) {
-            Ok(_) => {
-                // 如果这是文件夹重命名，记录到映射表中（在执行成功后）
-                if is_folder {
-                    renamed_folders.insert(old_path.clone(), new_path.clone());
-                }
-                
-                results.push(RenameResult {
-                    original: original.clone(),
-                    new_name: new_name.clone(),
-                    success: true,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                results.push(RenameResult {
-                    original: original.clone(),
-                    new_name: new_name.clone(),
-                    success: false,
-                    error: Some(format!("重命名失败: {}", e)),
-                });
-            }
-        }
-    }
-
-    Ok(results)
+    Ok(None)
 }
 
 /// 获取文件夹内所有文件

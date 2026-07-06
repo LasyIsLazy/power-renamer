@@ -4,19 +4,24 @@
 mod commands;
 mod js_engine;
 mod js_utils;
+mod preview_session;
 
 use commands::*;
 use js_engine::JsEngine;
+use preview_session::PreviewSession;
 
 fn main() {
     let js_engine = JsEngine::new().expect("Failed to create JS engine");
+    let preview_session = PreviewSession::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(js_engine)
+        .manage(preview_session)
         .invoke_handler(tauri::generate_handler![
             preview_rename,
+            cancel_preview,
             execute_rename,
             get_folder_files,
             count_folder_files_recursive,

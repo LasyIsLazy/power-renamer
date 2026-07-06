@@ -31,6 +31,12 @@ async function loadSavedScripts() {
   }
 }
 
+const MD5_PREVIEW_PLACEHOLDER = '[md5-preview]'
+
+function isPlaceholderPreviewName(name) {
+  return name.includes(MD5_PREVIEW_PLACEHOLDER)
+}
+
 function buildPreviewFingerprint(state) {
   const params = state.currentScriptId
     ? state.scriptParams[state.currentScriptId] || {}
@@ -40,8 +46,21 @@ function buildPreviewFingerprint(state) {
     basePath: state.basePath,
     script: state.script,
     currentScriptId: state.currentScriptId,
+    previewMd5Mode: state.previewMd5Mode,
     params,
   })
+}
+
+const PREVIEW_MD5_MODE_KEY = 'previewMd5Mode'
+
+function loadPreviewMd5Mode() {
+  try {
+    const v = localStorage.getItem(PREVIEW_MD5_MODE_KEY)
+    if (v === 'always' || v === 'skip' || v === 'auto') return v
+  } catch {
+    // ignore
+  }
+  return 'auto'
 }
 
 export const useRenameStore = defineStore('rename', {
@@ -53,6 +72,13 @@ export const useRenameStore = defineStore('rename', {
     previewResults: [],
     hasPreviewed: false,
     previewFingerprint: null,
+    md5PreviewPlaceholder: false,
+    previewMd5Mode: loadPreviewMd5Mode(),
+    previewInProgress: false,
+    previewProgress: { completed: 0, total: 0, currentPath: null, phase: '' },
+    previewCancelled: false,
+    executeInProgress: false,
+    executeProgress: { completed: 0, total: 0, currentPath: null, phase: '' },
     sessionScriptLogs: [],
     history: [],
     undoStack: [],
@@ -84,9 +110,22 @@ export const useRenameStore = defineStore('rename', {
       const counts = {}
       for (const r of state.previewResults) {
         if (r.error || r.original === r.new_name) continue
+        if (isPlaceholderPreviewName(r.new_name)) continue
         counts[r.new_name] = (counts[r.new_name] || 0) + 1
       }
       return Object.keys(counts).filter((k) => counts[k] > 1)
+    },
+    conflictDetails: (state) => {
+      const mapping = {}
+      for (const r of state.previewResults) {
+        if (r.error || r.original === r.new_name) continue
+        if (isPlaceholderPreviewName(r.new_name)) continue
+        if (!mapping[r.new_name]) mapping[r.new_name] = []
+        mapping[r.new_name].push(r.original)
+      }
+      return Object.entries(mapping)
+        .filter(([, originals]) => originals.length > 1)
+        .map(([newName, originals]) => ({ newName, originals }))
     },
     hasConflicts() {
       return this.conflictPaths.length > 0
@@ -104,6 +143,10 @@ export const useRenameStore = defineStore('rename', {
       this.previewResults = []
       this.hasPreviewed = false
       this.previewFingerprint = null
+      this.md5PreviewPlaceholder = false
+      this.previewInProgress = false
+      this.previewProgress = { completed: 0, total: 0, currentPath: null, phase: '' }
+      this.previewCancelled = false
       this.sessionScriptLogs = []
     },
 
@@ -339,45 +382,194 @@ export const useRenameStore = defineStore('rename', {
         return
       }
 
+      if (this.previewInProgress) {
+        return
+      }
+
       this.loading = true
+      this.previewInProgress = true
+      this.previewCancelled = false
       this.error = null
+      this.previewResults = []
+      this.sessionScriptLogs = []
+      this.previewProgress = { completed: 0, total: 0, currentPath: null, phase: '' }
+      this.hasPreviewed = false
+      this.md5PreviewPlaceholder = false
+
+      const { listen } = await import('@tauri-apps/api/event')
+      const unlisteners = []
+
+      const onChunk = (event) => {
+        const { mappings = [], logs = [] } = event.payload || {}
+        console.debug('[preview] chunk', mappings.length, 'mappings')
+        for (const [original, new_name] of mappings) {
+          this.previewResults.push({ original, new_name, error: null })
+          if (new_name.includes(MD5_PREVIEW_PLACEHOLDER)) {
+            this.md5PreviewPlaceholder = true
+          }
+        }
+        if (logs.length > 0) {
+          this.sessionScriptLogs.push(...logs)
+        }
+      }
+
+      const onProgress = (event) => {
+        const p = event.payload || {}
+        const completed = p.completed ?? 0
+        const total = p.total ?? 0
+        const currentPath = p.currentPath ?? p.current_path ?? null
+        const phase = p.phase ?? ''
+        console.debug('[preview] progress', completed, '/', total, phase, currentPath)
+        this.previewProgress = { completed, total, currentPath, phase }
+      }
+
+      let completeResolver = () => {}
+      const completePromise = new Promise((resolve) => {
+        completeResolver = resolve
+      })
+
+      const onComplete = (event) => {
+        const payload = event.payload || {}
+        console.debug('[preview] complete', payload)
+        this.hasPreviewed = true
+        this.previewFingerprint = buildPreviewFingerprint(this)
+        this.md5PreviewPlaceholder =
+          payload.md5PreviewPlaceholder ??
+          payload.md5_preview_placeholder ??
+          this.md5PreviewPlaceholder
+        this.previewCancelled = !!payload.cancelled
+
+        const errors = payload.errors || []
+        if (errors.length > 0) {
+          this.error = errors.join('\n')
+        } else if (payload.cancelled) {
+          this.error = this.previewResults.length > 0
+            ? '预览已取消（已保留已完成的结果）'
+            : '预览已取消'
+        } else {
+          this.error = null
+        }
+        completeResolver()
+      }
 
       try {
+        unlisteners.push(await listen('preview-chunk', onChunk))
+        unlisteners.push(await listen('preview-progress', onProgress))
+        unlisteners.push(await listen('preview-complete', onComplete))
+
         const invoke = await getInvoke()
         const fileNames = this.basePath
           ? [this.basePath]
           : this.files.map((f) => f.path)
         const params = this.getCurrentScriptParams()
 
-        const result = await invoke('preview_rename', {
+        let invokeError = null
+        const invokePromise = invoke('preview_rename', {
           files: fileNames,
           script: this.script,
           basePath: null,
           params: params && Object.keys(params).length > 0 ? params : null,
+          previewMd5Mode: this.previewMd5Mode,
+        }).catch((e) => {
+          invokeError = e
+          completeResolver()
+          return null
         })
 
-        this.previewResults = result.mappings.map(([original, new_name]) => ({
-          original,
-          new_name,
-          error: null,
-        }))
-
-        this.sessionScriptLogs = result.logs || []
-        this.hasPreviewed = true
-        this.previewFingerprint = buildPreviewFingerprint(this)
-
-        if (result.errors && result.errors.length > 0) {
-          this.error = result.errors.join('\n')
-        } else {
-          this.error = null
+        await completePromise
+        await invokePromise
+        if (invokeError) {
+          throw invokeError
         }
       } catch (error) {
+        completeResolver()
         this.error = `预览失败: ${error}`
         console.error(error)
-        this.invalidatePreview()
+        if (!this.hasPreviewed) {
+          this.previewResults = []
+        }
       } finally {
+        unlisteners.forEach((fn) => fn())
         this.loading = false
+        this.previewInProgress = false
       }
+    },
+
+    async cancelPreview() {
+      if (!this.previewInProgress) return
+      try {
+        const invoke = await getInvoke()
+        await invoke('cancel_preview')
+      } catch (error) {
+        console.error('Failed to cancel preview:', error)
+      }
+    },
+
+    async cancelPreview() {
+      if (!this.previewInProgress) return
+      try {
+        const invoke = await getInvoke()
+        await invoke('cancel_preview')
+      } catch (error) {
+        console.error('Failed to cancel preview:', error)
+      }
+    },
+
+    async applyExecuteResults(results) {
+      const mappings = results
+        .filter((r) => r.success)
+        .map((r) => ({ original: r.original, new_name: r.new_name }))
+
+      if (mappings.length > 0) {
+        this.undoStack.push({
+          files: [...this.files],
+          mappings,
+          basePath: this.basePath,
+          timestamp: new Date().toISOString(),
+        })
+      }
+
+      this.history.unshift({
+        timestamp: new Date().toISOString(),
+        files: [...this.files],
+        script: this.script,
+        results,
+      })
+      await this.persistHistory()
+
+      const successCount = results.filter((r) => r.success).length
+      if (successCount > 0) {
+        results.forEach((result) => {
+          if (result.success) {
+            const fileIndex = this.files.findIndex(
+              (f) => f.name === result.original || f.path === result.original
+            )
+            if (fileIndex !== -1) {
+              const newName = result.new_name.split(/[/\\]/).pop() || result.new_name
+              this.files[fileIndex].name = newName
+              if (this.files[fileIndex].path.includes(result.original)) {
+                this.files[fileIndex].path = this.files[fileIndex].path.replace(
+                  result.original,
+                  result.new_name
+                )
+              }
+            }
+          }
+        })
+        if (this.basePath) {
+          await this.refreshFolderFileCount()
+        }
+      }
+
+      const errors = results.filter((r) => !r.success)
+      if (errors.length > 0) {
+        this.error = `部分文件重命名失败: ${errors.map((e) => e.error).join('; ')}`
+      } else {
+        this.error = null
+      }
+
+      this.invalidatePreview()
+      return { confirmed: true, executed: true, results }
     },
 
     async executeRename(skipConfirm = false) {
@@ -397,92 +589,85 @@ export const useRenameStore = defineStore('rename', {
         }
       }
 
-      if (this.hasConflicts) {
-        this.error = `存在 ${this.conflictPaths.length} 个目标路径冲突，请修改脚本后重新预览`
-        return { confirmed: false, executed: false }
-      }
-
       if (!skipConfirm) {
         return { confirmed: false, executed: false, needsConfirm: true }
       }
 
       this.loading = true
+      this.executeInProgress = true
       this.error = null
+      this.executeProgress = { completed: 0, total: 0, currentPath: null, phase: '' }
+
+      const { listen } = await import('@tauri-apps/api/event')
+      const unlisteners = []
+
+      const onProgress = (event) => {
+        const p = event.payload || {}
+        this.executeProgress = {
+          completed: p.completed ?? 0,
+          total: p.total ?? 0,
+          currentPath: p.currentPath ?? p.current_path ?? null,
+          phase: p.phase ?? '',
+        }
+      }
+
+      let completeResolver = () => {}
+      const completePromise = new Promise((resolve) => {
+        completeResolver = resolve
+      })
+
+      const onComplete = async (event) => {
+        const payload = event.payload || {}
+        if (payload.error) {
+          this.error = `执行重命名失败: ${payload.error}`
+          completeResolver()
+          return
+        }
+        const results = payload.results || []
+        await this.applyExecuteResults(results)
+        completeResolver()
+      }
 
       try {
+        unlisteners.push(await listen('execute-progress', onProgress))
+        unlisteners.push(await listen('execute-complete', onComplete))
+
         const invoke = await getInvoke()
         const fileNames = this.basePath
           ? [this.basePath]
           : this.files.map((f) => f.path)
         const params = this.getCurrentScriptParams()
 
-        const results = await invoke('execute_rename', {
+        let invokeError = null
+        const invokePromise = invoke('execute_rename', {
           files: fileNames,
           script: this.script,
           basePath: null,
           params: params && Object.keys(params).length > 0 ? params : null,
+          silent: false,
+        }).catch((e) => {
+          invokeError = e
+          completeResolver()
+          return null
         })
 
-        const mappings = results
-          .filter((r) => r.success)
-          .map((r) => ({ original: r.original, new_name: r.new_name }))
-
-        if (mappings.length > 0) {
-          this.undoStack.push({
-            files: [...this.files],
-            mappings,
-            basePath: this.basePath,
-            timestamp: new Date().toISOString(),
-          })
+        await completePromise
+        await invokePromise
+        if (invokeError) {
+          throw invokeError
         }
 
-        this.history.unshift({
-          timestamp: new Date().toISOString(),
-          files: [...this.files],
-          script: this.script,
-          results,
-        })
-        await this.persistHistory()
-
-        const successCount = results.filter((r) => r.success).length
-        if (successCount > 0) {
-          results.forEach((result) => {
-            if (result.success) {
-              const fileIndex = this.files.findIndex(
-                (f) => f.name === result.original || f.path === result.original
-              )
-              if (fileIndex !== -1) {
-                const newName = result.new_name.split(/[/\\]/).pop() || result.new_name
-                this.files[fileIndex].name = newName
-                if (this.files[fileIndex].path.includes(result.original)) {
-                  this.files[fileIndex].path = this.files[fileIndex].path.replace(
-                    result.original,
-                    result.new_name
-                  )
-                }
-              }
-            }
-          })
-          if (this.basePath) {
-            await this.refreshFolderFileCount()
-          }
-        }
-
-        const errors = results.filter((r) => !r.success)
-        if (errors.length > 0) {
-          this.error = `部分文件重命名失败: ${errors.map((e) => e.error).join('; ')}`
-        } else {
-          this.error = null
-        }
-
-        this.invalidatePreview()
-        return { confirmed: true, executed: true, results }
+        return { confirmed: true, executed: true }
       } catch (error) {
+        completeResolver()
         this.error = `执行重命名失败: ${error}`
         console.error(error)
         return { confirmed: true, executed: false }
       } finally {
+        unlisteners.forEach((fn) => fn())
         this.loading = false
+        this.executeInProgress = false
+        this.executeProgress = { completed: 0, total: 0, currentPath: null, phase: '' }
       }
     },
 
@@ -516,9 +701,11 @@ export const useRenameStore = defineStore('rename', {
           files: filesToRename,
           script,
           basePath: lastOperation.basePath || this.basePath,
+          silent: true,
         })
 
-        results.forEach((result) => {
+        const resultList = results || []
+        resultList.forEach((result) => {
           if (result.success) {
             const fileIndex = this.files.findIndex(
               (f) => f.name === result.original.split(/[/\\]/).pop() || f.path === result.original
@@ -535,7 +722,7 @@ export const useRenameStore = defineStore('rename', {
           timestamp: new Date().toISOString(),
           files: [...this.files],
           script: '撤销操作',
-          results,
+          results: resultList,
         })
         await this.persistHistory()
         this.invalidatePreview()
@@ -550,6 +737,17 @@ export const useRenameStore = defineStore('rename', {
 
     clearError() {
       this.error = null
+    },
+
+    setPreviewMd5Mode(mode) {
+      if (!['auto', 'always', 'skip'].includes(mode)) return
+      this.previewMd5Mode = mode
+      try {
+        localStorage.setItem(PREVIEW_MD5_MODE_KEY, mode)
+      } catch {
+        // ignore
+      }
+      this.invalidatePreview()
     },
 
     toggleHistoryDrawer() {
